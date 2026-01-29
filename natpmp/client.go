@@ -99,27 +99,31 @@ func NewClient(gateway net.IP) *Client {
 
 // AddPortMapping creates a port mapping with retry and timeout
 func (c *Client) AddPortMapping(protocol string, internalPort, externalPort, lifetime int) (*PortMappingResponse, error) {
-	result, err := c.sendPortMappingRequest(protocol, internalPort, externalPort, lifetime, 5*time.Second)
-	return result, err
-}
-
-// DeletePortMapping removes a port mapping
-func (c *Client) DeletePortMapping(protocol string, internalPort int) error {
-	_, err := c.sendPortMappingRequest(protocol, internalPort, 0, 0, 5*time.Second)
-	return err
-}
-
-// sendPortMappingRequest sends a NAT-PMP port mapping request with timeout
-func (c *Client) sendPortMappingRequest(protocol string, internalPort, externalPort, lifetime int, timeout time.Duration) (*PortMappingResponse, error) {
-	// Create the request
 	request := createPortMappingRequest(protocol, uint16(internalPort), uint16(externalPort), uint32(lifetime))
 
-	// Send request and get response
-	responseData, err := forwardRequest(request, c.gateway, timeout)
+	// Forward with retry
+	var responseData []byte
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		responseData, err = forwardRequest(request, c.gateway, 10*time.Second)
+		if err == nil {
+			break
+		}
+		if attempt < 2 {
+			time.Sleep(time.Second)
+		}
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse the response
 	return parsePortMappingResponse(responseData)
+}
+
+// DeletePortMapping removes a port mapping (sets lifetime to 0)
+func (c *Client) DeletePortMapping(protocol string, internalPort int) error {
+	request := createPortMappingRequest(protocol, uint16(internalPort), 0, 0)
+	_, err := forwardRequest(request, c.gateway, 10*time.Second)
+	return err
 }
