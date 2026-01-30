@@ -21,15 +21,20 @@ type Server struct {
 	conn                   *net.UDPConn
 	externalAddressHandler ExternalAddressHandler
 	portMappingHandler     PortMappingHandler
-	mu                     sync.RWMutex // Protects conn
+	mu                     sync.RWMutex  // Protects conn
+	sem                    chan struct{} // Semaphore to limit concurrent handlers
+	maxConcurrent          int
 }
 
 // NewServer creates a new NAT-PMP server
 func NewServer(listenAddr string, externalAddressHandler ExternalAddressHandler, portMappingHandler PortMappingHandler) *Server {
+	const maxConcurrentHandlers = 100
 	return &Server{
 		listenAddr:             listenAddr,
 		externalAddressHandler: externalAddressHandler,
 		portMappingHandler:     portMappingHandler,
+		sem:                    make(chan struct{}, maxConcurrentHandlers),
+		maxConcurrent:          maxConcurrentHandlers,
 	}
 }
 
@@ -59,7 +64,9 @@ func (s *Server) Stop() error {
 	defer s.mu.Unlock()
 
 	if s.conn != nil {
-		return s.conn.Close()
+		err := s.conn.Close()
+		s.conn = nil // Prevent double-close
+		return err
 	}
 	return nil
 }
@@ -106,8 +113,18 @@ func (s *Server) serve(ctx context.Context) {
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buffer[:n])
 
-		// Handle request in a goroutine
-		go s.handleRequest(dataCopy, remoteAddr)
+		// Try to acquire semaphore (non-blocking)
+		select {
+		case s.sem <- struct{}{}:
+			// Handle request in a goroutine
+			go func() {
+				defer func() { <-s.sem }()
+				s.handleRequest(dataCopy, remoteAddr)
+			}()
+		default:
+			// Too many concurrent requests, drop this one
+			slog.Warn("dropping request due to max concurrent handlers", "from", remoteAddr)
+		}
 	}
 }
 
@@ -133,7 +150,7 @@ func (s *Server) handleRequest(data []byte, remoteAddr *net.UDPAddr) {
 	// https://datatracker.ietf.org/doc/html/rfc6886
 	// If the opcode in the request is 128 or greater, then this is not a request; it's a response, and the NAT-PMP server MUST silently ignore it.
 	if opcode > 127 {
-		slog.Debug("received invalid opcode in request", "from", remoteAddr, "opcode", opcode, "error", "data less than 2 bytes long")
+		slog.Debug("ignoring response packet received on server", "from", remoteAddr, "opcode", opcode)
 		return
 	}
 
@@ -231,30 +248,6 @@ func createUnsupportedOpcodeResponse(request []byte) []byte {
 	response[1] = request[1] | 0x80
 	// Result Code: 5 (Unsupported Opcode)
 	binary.BigEndian.PutUint16(response[2:4], uint16(ResultUnsupportedOpcode))
-
-	return response
-}
-
-// setErrorResponseFields sets response fields to indicate an error
-func setErrorResponseFields(response []byte, result Result) []byte {
-	// Response needs at least 8 bytes: version, opcode, result code (2 bytes), seconds since epoch (4 bytes)
-	responseLen := len(response) + 4
-	if responseLen < 8 {
-		responseLen = 8
-	}
-
-	errorResponse := make([]byte, responseLen)
-	// Version
-	errorResponse[0] = 0
-	// Response opcode (top bit set + request opcode)
-	errorResponse[1] = response[1] | 0x80
-	// Result Code
-	binary.BigEndian.PutUint16(response[2:4], uint16(result))
-	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
-
-	if len(response) > 2 {
-		copy(response[2:], errorResponse[8:])
-	}
 
 	return response
 }

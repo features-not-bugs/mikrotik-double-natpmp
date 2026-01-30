@@ -122,8 +122,8 @@ func (p *PortMappingRequest) fromBytes(bytes []byte) error {
 	p.Protocol = protocol
 	// Internal Port
 	p.InternalPort = binary.BigEndian.Uint16(bytes[4:6])
-	// External Port
-	p.SuggestedExternalPort = binary.BigEndian.Uint16(bytes[4:6])
+	// Suggested External Port
+	p.SuggestedExternalPort = binary.BigEndian.Uint16(bytes[6:8])
 	// Lifetime in Seconds
 	p.RequestedLifetimeInSeconds = binary.BigEndian.Uint32(bytes[8:12])
 

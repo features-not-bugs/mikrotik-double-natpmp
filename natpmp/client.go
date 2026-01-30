@@ -57,7 +57,13 @@ func (c *Client) GetExternalAddress() (*ExternalAddressResponse, error) {
 // Set the lifetime to 0 for an unmap request
 // Set the internal and external port to 0 for all ports (you can also specify each individually)
 func (c *Client) SendPortMappingRequest(request *PortMappingRequest) (*PortMappingResponse, error) {
-	responseData, err := c.sendReceive(request.toBytes(), 10*time.Second)
+	// Use shorter timeout for deletion requests (best effort cleanup)
+	timeout := 10 * time.Second
+	if request.RequestedLifetimeInSeconds == 0 {
+		timeout = 2 * time.Second
+	}
+
+	responseData, err := c.sendReceive(request.toBytes(), timeout)
 	if err != nil {
 		return nil, err
 	}

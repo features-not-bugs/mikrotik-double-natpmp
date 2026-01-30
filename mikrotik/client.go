@@ -3,19 +3,23 @@ package mikrotik
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	gslog "log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/features-not-bugs/mikrotik-double-natpmp/config"
 	"github.com/go-routeros/routeros/v3"
 )
 
+var slog = gslog.Default().With("component", "natpmp-client")
+
 // Client wraps the MikroTik RouterOS API client
 type Client struct {
 	client *routeros.Client
 	config *config.Config
+	mu     sync.Mutex // Protects concurrent API calls
 }
 
 // PortMappingResult represents the result of creating a port mapping
@@ -61,6 +65,9 @@ func (c *Client) Close() error {
 
 // GetInterfaceForGateway determines which interface would be used to reach the gateway
 func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Use /ip/route/check to determine the actual route that would be used
 	reply, err := c.client.Run(
 		"/ip/route/check",
@@ -86,6 +93,14 @@ func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
 
 // isPortAvailable checks if a dst-port is already in use by any dst-nat rule
 func (c *Client) isPortAvailable(protocol string, port int) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.isPortAvailableLocked(protocol, port)
+}
+
+// isPortAvailableLocked is the internal version that assumes mutex is already held
+func (c *Client) isPortAvailableLocked(protocol string, port int) (bool, error) {
 	protocolLower := protocol
 	if protocol == "tcp" || protocol == "TCP" {
 		protocolLower = "tcp"
@@ -114,6 +129,9 @@ func (c *Client) isPortAvailable(protocol string, port int) (bool, error) {
 
 // getUsedPorts fetches all dst-nat ports currently in use on the interface for a given protocol
 func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	protocolLower := protocol
 	if protocol == "tcp" || protocol == "TCP" {
 		protocolLower = "tcp"
@@ -216,6 +234,9 @@ func (c *Client) AddPortMapping(protocol string, internalPort, externalPort int,
 
 // addPortMapping is the internal implementation without retry
 func (c *Client) addPortMapping(protocol string, internalPort, externalPort int, lifetime uint32, toAddress string) (*PortMappingResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	protocolLower := protocol
 	if protocol == "tcp" || protocol == "TCP" {
 		protocolLower = "tcp"
@@ -234,7 +255,7 @@ func (c *Client) addPortMapping(protocol string, internalPort, externalPort int,
 		requestedPort = internalPort
 	}
 
-	available, err := c.isPortAvailable(protocolLower, requestedPort)
+	available, err := c.isPortAvailableLocked(protocolLower, requestedPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check port availability: %w", err)
 	}
@@ -287,6 +308,9 @@ func (c *Client) addPortMapping(protocol string, internalPort, externalPort int,
 
 // DeletePortMapping removes a dst-nat rule by finding it via comment
 func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	protocolLower := protocol
 	if protocol == "tcp" || protocol == "TCP" {
 		protocolLower = "tcp"
@@ -330,6 +354,9 @@ func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress 
 
 // DeletePortMappingByID removes a dst-nat rule by rule ID
 func (c *Client) DeletePortMappingByID(ruleID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	_, err := c.client.Run(
 		"/ip/firewall/nat/remove",
 		"=.id="+ruleID,
@@ -346,6 +373,9 @@ func (c *Client) DeletePortMappingByID(ruleID string) error {
 
 // GetExternalIP returns the WAN IP address from the router
 func (c *Client) GetExternalIP() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Get the first active address from the WAN interface
 	// This is router-specific - adjust based on your setup
 	reply, err := c.client.Run("/ip/address/print")
@@ -377,6 +407,9 @@ type NATRule struct {
 
 // GetAllDoubleNATPMPRules returns all dst-nat rules created by this service
 func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Find all rules with our comment prefix
 	reply, err := c.client.Run(
 		"/ip/firewall/nat/print",
@@ -412,6 +445,9 @@ func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
 
 // DeleteRuleByID removes a dst-nat rule by its ID
 func (c *Client) DeleteRuleByID(ruleID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	_, err := c.client.Run(
 		"/ip/firewall/nat/remove",
 		"=.id="+ruleID,

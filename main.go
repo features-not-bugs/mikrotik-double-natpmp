@@ -88,9 +88,11 @@ func main() {
 	}
 	slog.Info("NAT-PMP server started", "listen_addr", cfg.ListenAddr)
 
-	// Start periodic reconciliation (every 1 minute)
+	// Start periodic reconciliation (every 10 minutes as safety net)
+	// This only catches orphaned rules from crashes/network issues
+	// Normal expiration is handled by per-mapping timers
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 
 		for {
@@ -115,29 +117,21 @@ func main() {
 	// Cancel context to stop background tasks
 	cancel()
 
-	// Stop NAT-PMP server
-	slog.Info("Stopping NAT-PMP server...")
-	if err := mapper.Stop(); err != nil {
-		slog.Error("failed to stop NAT-PMP server", "error", err)
-	}
-
-	// Delete all port mappings
-	slog.Info("Deleting all port mappings...")
-
-	done := make(chan struct{})
+	// Stop NAT-PMP server and cleanup all mappings (with timeout)
+	done := make(chan error, 1)
 	go func() {
-		if err := mapper.DeleteAll(); err != nil {
-			slog.Error("failed to delete all mappings", "error", err)
-		}
-		close(done)
+		done <- mapper.Stop()
 	}()
 
-	// Wait for cleanup with timeout
 	select {
-	case <-done:
-		slog.Info("Cleanup completed successfully")
+	case err := <-done:
+		if err != nil {
+			slog.Error("shutdown failed", "error", err)
+		} else {
+			slog.Info("Shutdown completed successfully")
+		}
 	case <-time.After(30 * time.Second):
-		slog.Warn("Cleanup timed out after 30 seconds")
+		slog.Warn("Shutdown timed out after 30 seconds")
 	}
 
 	slog.Info("Shutdown complete")

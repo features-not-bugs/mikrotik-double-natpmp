@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -32,6 +31,9 @@ type mapping struct {
 	Lifetime  uint32
 	CreatedAt time.Time
 	ExpiresAt time.Time
+
+	// Expiration timer - fires when mapping expires
+	expirationTimer *time.Timer
 }
 
 // key uniquely identifies a mapping
@@ -51,6 +53,7 @@ type mapper struct {
 	// Mapping storage
 	mu       sync.RWMutex
 	mappings map[key]*mapping
+	keyLocks sync.Map // map[key]*sync.Mutex - per-key locks for serializing operations
 }
 
 // newMapper creates a new mapping service
@@ -72,23 +75,84 @@ func newMapper(cfg *config.Config, mikroTikClient *mikrotik.Client) *mapper {
 	return m
 }
 
+// getKeyLock returns the mutex for a specific key, creating one if needed.
+// This serializes all operations on the same mapping.
+func (s *mapper) getKeyLock(k key) *sync.Mutex {
+	lock, _ := s.keyLocks.LoadOrStore(k, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 // Start starts the NAT-PMP server
 func (s *mapper) Start(ctx context.Context) error {
 	return s.server.Start(ctx)
 }
 
-// Stop stops the NAT-PMP server
+// Stop stops the NAT-PMP server and cleans up all mappings
 func (s *mapper) Stop() error {
-	return s.server.Stop()
+	// First stop the server to prevent new requests
+	if err := s.server.Stop(); err != nil {
+		return err
+	}
+
+	// Copy all mappings while holding lock
+	s.mu.Lock()
+	mappingsToDelete := make([]*mapping, 0, len(s.mappings))
+	for _, mapping := range s.mappings {
+		// Stop expiration timer
+		if mapping.expirationTimer != nil {
+			mapping.expirationTimer.Stop()
+		}
+		mappingCopy := *mapping
+		mappingsToDelete = append(mappingsToDelete, &mappingCopy)
+	}
+	// Clear the map
+	s.mappings = make(map[key]*mapping)
+	s.mu.Unlock()
+
+	if len(mappingsToDelete) == 0 {
+		slog.Info("No mappings to clean up")
+		return nil
+	}
+
+	slog.Info("Cleaning up all mappings on shutdown", "count", len(mappingsToDelete))
+
+	// Delete external resources without holding lock
+	for _, mapping := range mappingsToDelete {
+		// Delete from local MikroTik using rule ID (faster than searching by comment)
+		if err := s.mikrotik.DeletePortMappingByID(mapping.MikroTikRuleID); err != nil {
+			slog.Error("Failed to delete local mapping during shutdown",
+				"error", err,
+				"rule_id", mapping.MikroTikRuleID)
+		}
+
+		// Delete VPN mapping
+		deleteReq := &natpmp.PortMappingRequest{
+			Protocol:                   mapping.Protocol,
+			InternalPort:               mapping.LocalExternalPort,
+			SuggestedExternalPort:      0,
+			RequestedLifetimeInSeconds: 0,
+		}
+		if _, err := s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq); err != nil {
+			slog.Error("Failed to delete VPN mapping during shutdown", "error", err)
+		}
+	}
+
+	slog.Info("All mappings cleaned up")
+	return nil
 }
 
 // handleExternalAddress returns the external IP address
-func (s *mapper) handleExternalAddress(remoteIP net.IP) *natpmp.ExternalAddressResponse {
-	return &natpmp.ExternalAddressResponse{
-		ResultCode:      natpmp.ResultSuccess,
-		Epoch:           uint32(time.Now().Unix()),
-		ExternalAddress: s.config.VpnGateway.To4(),
+func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressResponse {
+	response, err := s.vpnGatewayNATClient.GetExternalAddress()
+	if err != nil {
+		slog.Error("failed to request external address from vpn gateway", "client_ip", clientIP, "error", err)
+		response = &natpmp.ExternalAddressResponse{
+			ResultCode:      natpmp.ResultNetworkFailure,
+			Epoch:           uint32(time.Now().Unix()),
+			ExternalAddress: net.IPv4(0, 0, 0, 0),
+		}
 	}
+	return response
 }
 
 // handlePortMapping processes a NAT-PMP port mapping request
@@ -102,39 +166,47 @@ func (s *mapper) handlePortMapping(request *natpmp.PortMappingRequest, remoteIP 
 		"suggested_external_port", request.SuggestedExternalPort,
 		"lifetime", request.RequestedLifetimeInSeconds)
 
-	// Check if this is a deletion request
-	if request.RequestedLifetimeInSeconds == 0 {
-		return s.handlePortMappingDeletion(request, clientIP)
-	}
-
-	// Check if this is a renewal
-	key := key{
+	k := key{
 		ClientIP:     clientIP,
 		Protocol:     request.Protocol,
 		InternalPort: request.InternalPort,
 	}
 
+	// Serialize all operations on this specific mapping
+	keyLock := s.getKeyLock(k)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	// Check if this is a deletion request
+	if request.RequestedLifetimeInSeconds == 0 {
+		return s.handlePortMappingDeletion(request, clientIP, k)
+	}
+
+	// Check if this is a renewal
 	s.mu.RLock()
-	existingMapping, isRenewal := s.mappings[key]
+	existingMapping, isRenewal := s.mappings[k]
+	s.mu.RUnlock()
+
 	if isRenewal {
 		// Copy the mapping data while holding the lock to avoid races
 		mappingCopy := *existingMapping
-		s.mu.RUnlock()
 		return s.handlePortMappingRenewal(&mappingCopy, request)
 	}
-	s.mu.RUnlock()
 
 	// Create new mapping
-	return s.handlePortMappingCreation(request, clientIP)
+	return s.handlePortMappingCreation(request, clientIP, k)
 }
 
 // handlePortMappingCreation creates a new port mapping
-func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, clientIP string) *natpmp.PortMappingResponse {
+// Caller must hold the key lock.
+func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, clientIP string, k key) *natpmp.PortMappingResponse {
 	// Create transaction for rollback support
 	tx := utility.NewTransaction()
 	defer func() {
 		if tx != nil && !tx.Committed() {
-			_ = tx.Rollback()
+			if err := tx.Rollback(); err != nil {
+				slog.Error("Failed to rollback transaction", "error", err)
+			}
 		}
 	}()
 
@@ -285,41 +357,59 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 }
 
 // handlePortMappingDeletion deletes a port mapping
-func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, clientIP string) *natpmp.PortMappingResponse {
-	key := key{
-		ClientIP:     clientIP,
-		Protocol:     request.Protocol,
-		InternalPort: request.InternalPort,
-	}
-
-	// Copy mapping data while holding lock, then delete
+// Caller must hold the key lock.
+func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, clientIP string, k key) *natpmp.PortMappingResponse {
+	// Get and remove mapping from state
 	s.mu.Lock()
-	existingMapping, exists := s.mappings[key]
-	var mappingCopy mapping
-	if exists {
-		mappingCopy = *existingMapping // Copy before releasing lock
-		delete(s.mappings, key)
-	}
-	s.mu.Unlock() // Note: Using defer here would hold lock during external API calls below
-
-	if exists {
-		protocolStr := protocolToString(request.Protocol)
-
-		s.mikrotik.DeletePortMapping(protocolStr, int(request.InternalPort), clientIP)
-
-		// Delete VPN mapping - use copied data
-		deleteReq := &natpmp.PortMappingRequest{
-			Protocol:                   request.Protocol,
-			InternalPort:               mappingCopy.LocalExternalPort,
-			SuggestedExternalPort:      0,
-			RequestedLifetimeInSeconds: 0,
+	existingMapping, exists := s.mappings[k]
+	if !exists {
+		s.mu.Unlock()
+		// Mapping doesn't exist - return success (idempotent)
+		return &natpmp.PortMappingResponse{
+			Protocol:     request.Protocol,
+			ResultCode:   natpmp.ResultSuccess,
+			Epoch:        uint32(time.Now().Unix()),
+			InternalPort: request.InternalPort,
+			ExternalPort: 0,
+			Lifetime:     0,
 		}
-		s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq)
-
-		slog.Info("Port closed",
-			"protocol", protocolName(request.Protocol),
-			"internal_port", request.InternalPort)
 	}
+
+	// Stop expiration timer
+	if existingMapping.expirationTimer != nil {
+		existingMapping.expirationTimer.Stop()
+	}
+
+	mappingCopy := *existingMapping
+	delete(s.mappings, k)
+	s.mu.Unlock()
+
+	// Delete from local MikroTik using rule ID
+	if err := s.mikrotik.DeletePortMappingByID(mappingCopy.MikroTikRuleID); err != nil {
+		slog.Error("Failed to delete local port mapping",
+			"error", err,
+			"protocol", protocolName(request.Protocol),
+			"internal_port", request.InternalPort,
+			"rule_id", mappingCopy.MikroTikRuleID)
+	}
+
+	// Delete VPN mapping
+	deleteReq := &natpmp.PortMappingRequest{
+		Protocol:                   request.Protocol,
+		InternalPort:               mappingCopy.LocalExternalPort,
+		SuggestedExternalPort:      0,
+		RequestedLifetimeInSeconds: 0,
+	}
+	if _, err := s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq); err != nil {
+		slog.Error("Failed to delete VPN port mapping",
+			"error", err,
+			"protocol", protocolName(request.Protocol),
+			"internal_port", mappingCopy.LocalExternalPort)
+	}
+
+	slog.Info("Port closed",
+		"protocol", protocolName(request.Protocol),
+		"internal_port", request.InternalPort)
 
 	return &natpmp.PortMappingResponse{
 		Protocol:     request.Protocol,
@@ -368,9 +458,26 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 		InternalPort: request.InternalPort,
 	}
 	if m, exists := s.mappings[key]; exists {
+		// Stop old timer
+		if m.expirationTimer != nil {
+			m.expirationTimer.Stop()
+		}
+
+		// Update mapping fields
 		m.Lifetime = vpnResult.Lifetime
 		m.ExpiresAt = time.Now().Add(time.Duration(vpnResult.Lifetime) * time.Second)
 		m.VpnExternalPort = vpnResult.ExternalPort
+
+		// Set new expiration timer
+		duration := time.Until(m.ExpiresAt)
+		if duration < 0 {
+			duration = 0
+		}
+		m.expirationTimer = time.AfterFunc(duration, func() {
+			s.expireMapping(key)
+		})
+
+		slog.Debug("Updated expiration timer", "expires_in", duration)
 	}
 
 	slog.Info("Renewal successful",
@@ -399,6 +506,16 @@ func (s *mapper) addMapping(mapping *mapping) {
 		InternalPort: mapping.InternalPort,
 	}
 
+	// Set up expiration timer for this mapping
+	duration := time.Until(mapping.ExpiresAt)
+	if duration < 0 {
+		duration = 0 // Expire immediately
+	}
+
+	mapping.expirationTimer = time.AfterFunc(duration, func() {
+		s.expireMapping(key)
+	})
+
 	s.mappings[key] = mapping
 
 	slog.Info("Added mapping to state",
@@ -407,24 +524,73 @@ func (s *mapper) addMapping(mapping *mapping) {
 		"internal_port", mapping.InternalPort,
 		"local_external_port", mapping.LocalExternalPort,
 		"vpn_external_port", mapping.VpnExternalPort,
-		"mikrotik_rule_id", mapping.MikroTikRuleID)
+		"mikrotik_rule_id", mapping.MikroTikRuleID,
+		"expires_in", duration)
 }
 
-// ReconcileRules removes MikroTik rules that are not tracked in state
-// and cleans up expired mappings
+// expireMapping removes an expired mapping and cleans up resources
+func (s *mapper) expireMapping(k key) {
+	// Serialize with any concurrent operations on this key
+	keyLock := s.getKeyLock(k)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	s.mu.Lock()
+	mapping, exists := s.mappings[k]
+	if !exists {
+		s.mu.Unlock()
+		return // Already deleted
+	}
+
+	// Copy data before releasing lock
+	mappingCopy := *mapping
+	delete(s.mappings, k)
+	s.mu.Unlock()
+
+	// Cleanup external resources
+	slog.Info("Mapping expired, cleaning up",
+		"protocol", protocolName(mappingCopy.Protocol),
+		"internal_port", mappingCopy.InternalPort,
+		"client_ip", mappingCopy.ClientIP)
+
+	// Delete from local MikroTik using rule ID
+	if err := s.mikrotik.DeletePortMappingByID(mappingCopy.MikroTikRuleID); err != nil {
+		slog.Error("Failed to delete expired local port mapping",
+			"error", err,
+			"protocol", protocolName(mappingCopy.Protocol),
+			"internal_port", mappingCopy.InternalPort,
+			"client_ip", mappingCopy.ClientIP,
+			"rule_id", mappingCopy.MikroTikRuleID)
+	}
+
+	// Delete VPN mapping
+	deleteReq := &natpmp.PortMappingRequest{
+		Protocol:                   mappingCopy.Protocol,
+		InternalPort:               mappingCopy.LocalExternalPort,
+		SuggestedExternalPort:      0,
+		RequestedLifetimeInSeconds: 0,
+	}
+	if _, err := s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq); err != nil {
+		slog.Error("Failed to delete expired VPN port mapping",
+			"error", err,
+			"protocol", protocolName(mappingCopy.Protocol),
+			"internal_port", mappingCopy.LocalExternalPort)
+	}
+}
+
+// ReconcileRules removes stale MikroTik rules that are not tracked in state
+// This is a safety net to catch any rules that weren't cleaned up properly
+// (e.g., due to crashes, network issues during cleanup, etc.)
 func (s *mapper) ReconcileRules() error {
-	slog.Info("Starting reconciliation of MikroTik rules")
-
-	// First, clean up expired mappings
-	s.cleanupExpiredMappings()
-
 	// Get all our rules from MikroTik
 	rules, err := s.mikrotik.GetAllDoubleNATPMPRules()
 	if err != nil {
 		return err
 	}
 
-	slog.Info("Found MikroTik rules to reconcile", "count", len(rules))
+	if len(rules) == 0 {
+		return nil
+	}
 
 	// Build set of tracked rule IDs
 	s.mu.RLock()
@@ -440,7 +606,7 @@ func (s *mapper) ReconcileRules() error {
 	removedCount := 0
 	for _, rule := range rules {
 		if !trackedRules[rule.ID] {
-			slog.Info("Removing stale MikroTik rule",
+			slog.Warn("Found orphaned MikroTik rule, removing",
 				"rule_id", rule.ID,
 				"protocol", rule.Protocol,
 				"dst_port", rule.DstPort,
@@ -448,117 +614,15 @@ func (s *mapper) ReconcileRules() error {
 				"comment", rule.Comment)
 
 			if err := s.mikrotik.DeleteRuleByID(rule.ID); err != nil {
-				slog.Error("Failed to delete stale rule", "rule_id", rule.ID, "error", err)
+				slog.Error("Failed to delete orphaned rule", "rule_id", rule.ID, "error", err)
 			} else {
 				removedCount++
 			}
 		}
 	}
 
-	slog.Info("Reconciliation complete",
-		"total_rules", len(rules),
-		"removed", removedCount,
-		"kept", len(rules)-removedCount)
-
-	return nil
-}
-
-// cleanupExpiredMappings removes mappings that have expired
-func (s *mapper) cleanupExpiredMappings() {
-	now := time.Now()
-
-	// First pass: identify expired mappings and copy data we need
-	s.mu.Lock()
-	type expiredMapping struct {
-		key          key
-		protocol     natpmp.Protocol
-		internalPort uint16
-		localExtPort uint16
-		clientIP     string
-	}
-
-	expiredMappings := make([]expiredMapping, 0)
-	for key, mapping := range s.mappings {
-		if now.After(mapping.ExpiresAt) {
-			expiredMappings = append(expiredMappings, expiredMapping{
-				key:          key,
-				protocol:     mapping.Protocol,
-				internalPort: mapping.InternalPort,
-				localExtPort: mapping.LocalExternalPort,
-				clientIP:     mapping.ClientIP.String(),
-			})
-			slog.Info("Mapping expired",
-				"protocol", protocolName(mapping.Protocol),
-				"internal_port", mapping.InternalPort,
-				"client_ip", mapping.ClientIP,
-				"expired_at", mapping.ExpiresAt)
-		}
-	}
-
-	// Delete from map while holding lock
-	for _, expired := range expiredMappings {
-		delete(s.mappings, expired.key)
-	}
-	s.mu.Unlock() // Note: defer not used to avoid holding lock during external API calls below
-
-	// Second pass: cleanup external resources without holding lock
-	for _, expired := range expiredMappings {
-		protocolStr := protocolToString(expired.protocol)
-
-		s.mikrotik.DeletePortMapping(protocolStr, int(expired.internalPort), expired.clientIP)
-
-		// Delete VPN mapping
-		deleteReq := &natpmp.PortMappingRequest{
-			Protocol:                   expired.protocol,
-			InternalPort:               expired.localExtPort,
-			SuggestedExternalPort:      0,
-			RequestedLifetimeInSeconds: 0,
-		}
-		s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq)
-
-		slog.Info("Cleaned up expired mapping",
-			"protocol", protocolName(expired.protocol),
-			"internal_port", expired.internalPort)
-	}
-
-	if len(expiredMappings) > 0 {
-		slog.Info("Expired mappings cleaned up", "count", len(expiredMappings))
-	}
-}
-
-// DeleteAll removes all mappings (called on shutdown)
-func (s *mapper) DeleteAll() error {
-	// Copy all mappings while holding lock
-	s.mu.Lock()
-	mappingsToDelete := make([]*mapping, 0, len(s.mappings))
-	for _, mapping := range s.mappings {
-		mappingCopy := *mapping
-		mappingsToDelete = append(mappingsToDelete, &mappingCopy)
-	}
-	// Clear the map
-	s.mappings = make(map[key]*mapping)
-	s.mu.Unlock() // Note: defer not used to avoid holding lock during external API calls below
-
-	slog.Info("Deleting all mappings", "count", len(mappingsToDelete))
-
-	// Delete external resources without holding lock
-	for _, mapping := range mappingsToDelete {
-		protocolStr := protocolToString(mapping.Protocol)
-
-		if err := s.mikrotik.DeletePortMapping(protocolStr, int(mapping.InternalPort), mapping.ClientIP.String()); err != nil {
-			slog.Error("Failed to delete local mapping", "error", err)
-		}
-
-		// Delete VPN mapping
-		deleteReq := &natpmp.PortMappingRequest{
-			Protocol:                   mapping.Protocol,
-			InternalPort:               mapping.LocalExternalPort,
-			SuggestedExternalPort:      0,
-			RequestedLifetimeInSeconds: 0,
-		}
-		if _, err := s.vpnGatewayNATClient.SendPortMappingRequest(deleteReq); err != nil {
-			slog.Error("Failed to delete VPN mapping", "error", err)
-		}
+	if removedCount > 0 {
+		slog.Info("Reconciliation removed orphaned rules", "removed", removedCount)
 	}
 
 	return nil
@@ -578,25 +642,4 @@ func protocolName(protocol natpmp.Protocol) string {
 		return "TCP"
 	}
 	return "UDP"
-}
-
-// Get retrieves a mapping (for debugging/inspection)
-func (s *mapper) get(clientIP net.IP, protocol natpmp.Protocol, internalPort uint16) (*mapping, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	key := key{
-		ClientIP:     clientIP.String(),
-		Protocol:     protocol,
-		InternalPort: internalPort,
-	}
-
-	mapping, ok := s.mappings[key]
-	if !ok {
-		return nil, fmt.Errorf("mapping not found")
-	}
-
-	// Return a copy to avoid race conditions when caller accesses fields
-	mappingCopy := *mapping
-	return &mappingCopy, nil
 }
