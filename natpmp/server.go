@@ -3,100 +3,32 @@ package natpmp
 import (
 	"context"
 	"encoding/binary"
-	"log/slog"
+	"errors"
+	gslog "log/slog"
 	"net"
 	"time"
 )
 
-// CreateSuccessResponse creates a NAT-PMP success response
-func CreateSuccessResponse(opcode byte, internalPort, externalPort uint16, lifetime uint32) []byte {
-	response := make([]byte, 16)
-	response[0] = VersionNATPMP                                          // Version
-	response[1] = opcode + 128                                           // Response opcode (128 + request opcode)
-	binary.BigEndian.PutUint16(response[2:4], ResultSuccess)             // Result code: success
-	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix())) // Seconds since epoch
-	binary.BigEndian.PutUint16(response[8:10], internalPort)
-	binary.BigEndian.PutUint16(response[10:12], externalPort)
-	binary.BigEndian.PutUint32(response[12:16], lifetime)
-	return response
-}
+var slog = gslog.Default().With("component", "natpmp-server")
 
-// CreateErrorResponse creates a NAT-PMP error response
-func CreateErrorResponse(opcode byte, resultCode uint16) []byte {
-	var response []byte
-
-	if opcode == OpcodePublicAddress {
-		// PUBLIC_ADDRESS error response (12 bytes)
-		response = make([]byte, 12)
-		response[0] = VersionNATPMP // Version
-		response[1] = opcode + 128  // Response opcode (128 + request opcode)
-		binary.BigEndian.PutUint16(response[2:4], resultCode)
-		binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
-		// Bytes 8-11 are zeros
-	} else {
-		// MAP error response (16 bytes)
-		response = make([]byte, 16)
-		response[0] = VersionNATPMP // Version
-		response[1] = opcode + 128  // Response opcode
-		binary.BigEndian.PutUint16(response[2:4], resultCode)
-		binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
-		// Bytes 8-15 are zeros
-	}
-
-	return response
-}
-
-// CreateUnsupportedVersionResponse creates an UNSUPP_VERSION response
-// This tells clients we only support version 0 (NAT-PMP)
-func CreateUnsupportedVersionResponse(requestOpcode byte) []byte {
-	// UNSUPP_VERSION response (24 bytes minimum) - RFC 6887 Section 7.1
-	response := make([]byte, 24)
-	response[0] = VersionNATPMP           // Version: 0 (NAT-PMP) - tells client what version we support
-	response[1] = 0x80                    // R=1 (response bit)
-	response[1] |= (requestOpcode & 0x7F) // Copy opcode from request
-	response[3] = ResultUnsuppVersion     // Result Code: UNSUPP_VERSION (1)
-	// Lifetime at bytes 4-7: set to 0 for error response
-	binary.BigEndian.PutUint32(response[4:8], 0)
-	// Epoch time at bytes 8-11
-	binary.BigEndian.PutUint32(response[8:12], uint32(time.Now().Unix()))
-	// Reserved bytes 12-23 remain zero
-	return response
-}
-
-// HandlerFunc is a callback function for handling NAT-PMP requests
-type HandlerFunc func(req *Request, clientAddr net.IP) ([]byte, error)
+type ExternalAddressHandler func(remoteIP net.IP) *ExternalAddressResponse
+type PortMappingHandler func(request *PortMappingRequest, remoteIP net.IP) *PortMappingResponse
 
 // Server is a NAT-PMP server that handles requests via registered callbacks
 type Server struct {
-	listenAddr string
-	conn       *net.UDPConn
-
-	// Handler callbacks for each opcode
-	publicAddressHandler HandlerFunc
-	mapUDPHandler        HandlerFunc
-	mapTCPHandler        HandlerFunc
+	listenAddr             string
+	conn                   *net.UDPConn
+	externalAddressHandler ExternalAddressHandler
+	portMappingHandler     PortMappingHandler
 }
 
 // NewServer creates a new NAT-PMP server
-func NewServer(listenAddr string) *Server {
+func NewServer(listenAddr string, externalAddressHandler ExternalAddressHandler, portMappingHandler PortMappingHandler) *Server {
 	return &Server{
-		listenAddr: listenAddr,
+		listenAddr:             listenAddr,
+		externalAddressHandler: externalAddressHandler,
+		portMappingHandler:     portMappingHandler,
 	}
-}
-
-// OnPublicAddress registers a handler for PUBLIC_ADDRESS requests (opcode 0)
-func (s *Server) OnPublicAddress(handler HandlerFunc) {
-	s.publicAddressHandler = handler
-}
-
-// OnMapUDP registers a handler for MAP_UDP requests (opcode 1)
-func (s *Server) OnMapUDP(handler HandlerFunc) {
-	s.mapUDPHandler = handler
-}
-
-// OnMapTCP registers a handler for MAP_TCP requests (opcode 2)
-func (s *Server) OnMapTCP(handler HandlerFunc) {
-	s.mapTCPHandler = handler
 }
 
 // Start begins listening for NAT-PMP requests
@@ -112,8 +44,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.conn = conn
 
-	slog.Info("NAT-PMP server started", "listen_addr", s.listenAddr)
-
 	go s.serve(ctx)
 	return nil
 }
@@ -127,21 +57,28 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) serve(ctx context.Context) {
+	slog.Info("Server started", "listen_addr", s.listenAddr)
 	buffer := make([]byte, 1024)
 
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("Server stopped", "listen_addr", s.listenAddr)
 			return
 		default:
 		}
 
 		// Set read timeout
-		s.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		err := s.conn.SetReadDeadline(time.Now().Add(time.Second))
+		if err != nil {
+			slog.Error("failed to set read deadline when listening for natpmp messages", "error", err)
+			continue
+		}
 
 		n, remoteAddr, err := s.conn.ReadFromUDP(buffer)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
 			slog.Error("failed to read from UDP", "error", err)
@@ -158,67 +95,71 @@ func (s *Server) serve(ctx context.Context) {
 }
 
 func (s *Server) handleRequest(data []byte, remoteAddr *net.UDPAddr) {
-	req, err := ParseRequest(data)
-	if err != nil {
-		slog.Warn("received invalid NAT-PMP request", "from", remoteAddr, "error", err)
+	if len(data) < 2 {
+		slog.Debug("received invalid request", "from", remoteAddr, "error", "data less than 2 bytes long")
 		return
 	}
 
-	slog.Debug("Received NAT-PMP request", "version", req.Version, "opcode", req.Opcode, "from", remoteAddr)
+	version := data[0]
+	opcode := data[1]
 
-	// Handle non NATPMP (version 1) requests - send UNSUPP_VERSION to trigger client fallback to NAT-PMP
-	if req.Version != VersionNATPMP {
-		slog.Debug("Sending UNSUPP_VERSION response", "requested_version", req.Version, "from", remoteAddr)
-		response := CreateUnsupportedVersionResponse(req.Opcode)
+	slog.Debug("Received request", "version", version, "opcode", opcode, "from", remoteAddr)
+
+	// we only handle version 0 requests - send unsupported version response to trigger client fallback to version 0
+	if version != 0 {
+		slog.Debug("Sending UNSUPP_VERSION response", "requested_version", version, "from", remoteAddr)
+		response := createUnsupportedVersionResponse()
 		s.sendResponse(response, remoteAddr)
+		return
+	}
+
+	// https://datatracker.ietf.org/doc/html/rfc6886
+	// If the opcode in the request is 128 or greater, then this is not a request; it's a response, and the NAT-PMP server MUST silently ignore it.
+	if opcode > 127 {
+		slog.Debug("received invalid opcode in request", "from", remoteAddr, "opcode", opcode, "error", "data less than 2 bytes long")
 		return
 	}
 
 	// Route to the appropriate handler
 	var response []byte
-	var handlerErr error
 
-	switch req.Opcode {
-	case OpcodePublicAddress:
-		slog.Debug("Routing to PUBLIC_ADDRESS handler", "from", remoteAddr)
-		if s.publicAddressHandler != nil {
-			response, handlerErr = s.publicAddressHandler(req, remoteAddr.IP)
-		} else {
-			slog.Warn("no handler registered for PUBLIC_ADDRESS", "from", remoteAddr)
-			response = CreateErrorResponse(req.Opcode, ResultUnsuppOpcode)
+	switch opcode {
+	case byte(opcodePublicAddress):
+		slog.Debug("routing to external address handler", "from", remoteAddr)
+		if s.externalAddressHandler == nil {
+			response = createUnsupportedOpcodeResponse(data)
+			break
 		}
-	case OpcodeMapUDP:
-		slog.Debug("Routing to MAP_UDP handler", "from", remoteAddr, "internal_port", req.InternalPort, "lifetime", req.Lifetime)
-		if s.mapUDPHandler != nil {
-			response, handlerErr = s.mapUDPHandler(req, remoteAddr.IP)
-		} else {
-			slog.Warn("no handler registered for MAP_UDP", "from", remoteAddr)
-			response = CreateErrorResponse(req.Opcode, ResultUnsuppOpcode)
+		externalAddressResponse := s.externalAddressHandler(remoteAddr.IP)
+		response = externalAddressResponse.toBytes()
+	case byte(opcodeMapUDP):
+		fallthrough
+	case byte(opcodeMapTCP):
+		slog.Debug("routing to port mapping handler", "from", remoteAddr)
+		if s.portMappingHandler == nil {
+			response = createUnsupportedOpcodeResponse(data)
+			break
 		}
-	case OpcodeMapTCP:
-		slog.Debug("Routing to MAP_TCP handler", "from", remoteAddr, "internal_port", req.InternalPort, "lifetime", req.Lifetime)
-		if s.mapTCPHandler != nil {
-			response, handlerErr = s.mapTCPHandler(req, remoteAddr.IP)
-		} else {
-			slog.Warn("no handler registered for MAP_TCP", "from", remoteAddr)
-			response = CreateErrorResponse(req.Opcode, ResultUnsuppOpcode)
+		portMappingRequest := &PortMappingRequest{}
+		err := portMappingRequest.fromBytes(data)
+		if err != nil {
+			// Malformed request, lets just drop it...
+			slog.Debug("received malformed request", "from", remoteAddr, "err", err)
+			return
 		}
+		portMappingResponse := s.portMappingHandler(portMappingRequest, remoteAddr.IP)
+		response = portMappingResponse.toBytes()
+
 	default:
-		slog.Warn("received NAT-PMP request with unknown opcode", "opcode", req.Opcode, "from", remoteAddr)
-		response = CreateErrorResponse(req.Opcode, ResultUnsuppOpcode)
-	}
-
-	// If handler returned an error, send error response
-	if handlerErr != nil {
-		slog.Error("handler error", "error", handlerErr, "opcode", req.Opcode, "from", remoteAddr)
-		response = CreateErrorResponse(req.Opcode, ResultNetworkFailure)
+		slog.Warn("received request with unknown opcode", "opcode", opcode, "from", remoteAddr)
+		response = createUnsupportedOpcodeResponse(data)
 	}
 
 	// Send response
 	if response != nil {
 		s.sendResponse(response, remoteAddr)
 	} else {
-		slog.Warn("no response generated for request", "opcode", req.Opcode, "from", remoteAddr)
+		slog.Error("no response generated for request", "opcode", opcode, "from", remoteAddr)
 	}
 }
 
@@ -228,4 +169,66 @@ func (s *Server) sendResponse(response []byte, remoteAddr *net.UDPAddr) {
 	if err != nil {
 		slog.Error("failed to send response to client", "error", err, "to", remoteAddr)
 	}
+}
+
+// createUnsupportedVersionResponse creates an Unsupported Version response
+// This tells clients we only support version 0
+func createUnsupportedVersionResponse() []byte {
+	response := make([]byte, 8)
+	// Version: 0 (the version we support)
+	response[0] = 0
+	// OpCode: 0 (per RFC 6886 Section 3.5)
+	response[1] = 0
+	// Result Code: 1 (Unsupported Version)
+	binary.BigEndian.PutUint16(response[2:4], uint16(ResultUnsupportedVersion))
+	// Seconds Since Start of Epoch
+	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
+
+	return response
+}
+
+// createUnsupportedOpCodeResponse creates an Unsupported OpCode response
+// This tells clients we don't support that OpCode
+func createUnsupportedOpcodeResponse(request []byte) []byte {
+	// Response needs at least 4 bytes: version, opcode, result code (2 bytes)
+	responseLen := len(request)
+	if responseLen < 4 {
+		responseLen = 4
+	}
+
+	response := make([]byte, responseLen)
+	copy(response, request)
+
+	// Version: 0
+	response[0] = 0
+	// Opcode with response bit set
+	response[1] = request[1] | 0x80
+	// Result Code: 5 (Unsupported Opcode)
+	binary.BigEndian.PutUint16(response[2:4], uint16(ResultUnsupportedOpcode))
+
+	return response
+}
+
+// setErrorResponseFields sets response fields to indicate an error
+func setErrorResponseFields(response []byte, result Result) []byte {
+	// Response needs at least 8 bytes: version, opcode, result code (2 bytes), seconds since epoch (4 bytes)
+	responseLen := len(response) + 4
+	if responseLen < 8 {
+		responseLen = 8
+	}
+
+	errorResponse := make([]byte, responseLen)
+	// Version
+	errorResponse[0] = 0
+	// Response opcode (top bit set + request opcode)
+	errorResponse[1] = response[1] | 0x80
+	// Result Code
+	binary.BigEndian.PutUint16(response[2:4], uint16(result))
+	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
+
+	if len(response) > 2 {
+		copy(response[2:], errorResponse[8:])
+	}
+
+	return response
 }

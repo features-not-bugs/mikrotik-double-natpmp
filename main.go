@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,9 +10,7 @@ import (
 	"time"
 
 	"github.com/features-not-bugs/mikrotik-double-natpmp/config"
-	"github.com/features-not-bugs/mikrotik-double-natpmp/mapping"
 	"github.com/features-not-bugs/mikrotik-double-natpmp/mikrotik"
-	"github.com/features-not-bugs/mikrotik-double-natpmp/natpmp"
 )
 
 func main() {
@@ -73,126 +69,24 @@ func main() {
 		}
 	}
 
-	// Create mapping service
-	mappingService := mapping.NewService(cfg, mikroTikClient)
+	// Create mapper
+	mapper := newMapper(cfg, mikroTikClient)
 
 	// Reconcile existing MikroTik rules on startup
-	if err := mappingService.ReconcileRules(); err != nil {
+	if err := mapper.ReconcileRules(); err != nil {
 		slog.Error("failed to reconcile rules", "error", err)
 		// Don't exit, continue with service start
 	}
 
-	// Create NAT-PMP server
-	server := natpmp.NewServer(cfg.ListenAddr)
-
-	// Register PUBLIC_ADDRESS handler - forwards to VPN gateway
-	server.OnPublicAddress(func(req *natpmp.Request, clientAddr net.IP) ([]byte, error) {
-		slog.Debug("Handling PUBLIC_ADDRESS request", "from", clientAddr)
-
-		// Create PUBLIC_ADDRESS request (2 bytes: version 0, opcode 0)
-		request := make([]byte, 2)
-		request[0] = natpmp.VersionNATPMP
-		request[1] = natpmp.OpcodePublicAddress
-
-		// Forward to VPN gateway
-		return natpmp.ForwardRequest(request, cfg.VpnGateway, 10*time.Second)
-	})
-
-	// Register MAP_UDP handler
-	server.OnMapUDP(func(req *natpmp.Request, clientAddr net.IP) ([]byte, error) {
-		protocol := "udp"
-
-		// Handle deletion (lifetime = 0)
-		if req.Lifetime == 0 {
-			slog.Debug("Port mapping deletion request",
-				"from", clientAddr.String(),
-				"protocol", "UDP",
-				"internal_port", req.InternalPort)
-			err := mappingService.Delete(clientAddr, protocol, req.InternalPort)
-			if err != nil {
-				slog.Debug("Mapping not found for deletion (OK - idempotent)", "error", err, "port", req.InternalPort)
-				// Deletion is idempotent - success even if mapping doesn't exist
-			}
-			// Always return success for deletion (RFC 6886 - idempotent operation)
-			resp := natpmp.CreateSuccessResponse(natpmp.OpcodeMapUDP, req.InternalPort, 0, 0)
-			slog.Debug("Sending deletion success response", "port", req.InternalPort, "protocol", "UDP", "response_hex", fmt.Sprintf("%x", resp))
-			return resp, nil
-		}
-
-		// Log creation requests
-		slog.Info("Port forward request received",
-			"from", clientAddr.String(),
-			"protocol", "UDP",
-			"internal_port", req.InternalPort,
-			"suggested_external_port", req.SuggestedExtPort,
-			"lifetime", req.Lifetime)
-
-		// Create mapping
-		err := mappingService.Create(clientAddr, protocol, req.InternalPort, req.SuggestedExtPort, req.Lifetime)
-		if err != nil {
-			return nil, err
-		}
-
-		// Get the mapping to retrieve actual external port
-		m, err := mappingService.Get(clientAddr, protocol, req.InternalPort)
-		if err != nil {
-			return nil, err
-		}
-
-		return natpmp.CreateSuccessResponse(natpmp.OpcodeMapUDP, req.InternalPort, m.VpnExternalPort, m.Lifetime), nil
-	})
-
-	// Register MAP_TCP handler
-	server.OnMapTCP(func(req *natpmp.Request, clientAddr net.IP) ([]byte, error) {
-		protocol := "tcp"
-
-		// Handle deletion (lifetime = 0)
-		if req.Lifetime == 0 {
-			slog.Debug("Port mapping deletion request",
-				"from", clientAddr.String(),
-				"protocol", "TCP",
-				"internal_port", req.InternalPort)
-			err := mappingService.Delete(clientAddr, protocol, req.InternalPort)
-			if err != nil {
-				slog.Debug("Mapping not found for deletion (OK - idempotent)", "error", err, "port", req.InternalPort)
-				// Deletion is idempotent - success even if mapping doesn't exist
-			}
-			// Always return success for deletion (RFC 6886 - idempotent operation)
-			resp := natpmp.CreateSuccessResponse(natpmp.OpcodeMapTCP, req.InternalPort, 0, 0)
-			slog.Debug("Sending deletion success response", "port", req.InternalPort, "protocol", "TCP", "response_hex", fmt.Sprintf("%x", resp))
-			return resp, nil
-		}
-
-		// Log creation requests
-		slog.Info("Port forward request received",
-			"from", clientAddr.String(),
-			"protocol", "TCP",
-			"internal_port", req.InternalPort,
-			"suggested_external_port", req.SuggestedExtPort,
-			"lifetime", req.Lifetime)
-
-		// Create mapping
-		err := mappingService.Create(clientAddr, protocol, req.InternalPort, req.SuggestedExtPort, req.Lifetime)
-		if err != nil {
-			return nil, err
-		}
-
-		// Get the mapping to retrieve actual external port
-		m, err := mappingService.Get(clientAddr, protocol, req.InternalPort)
-		if err != nil {
-			return nil, err
-		}
-
-		return natpmp.CreateSuccessResponse(natpmp.OpcodeMapTCP, req.InternalPort, m.VpnExternalPort, m.Lifetime), nil
-	})
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := server.Start(ctx); err != nil {
-		slog.Error("failed to start server", "error", err)
+	// Start NAT-PMP server
+	if err := mapper.Start(ctx); err != nil {
+		slog.Error("failed to start NAT-PMP server", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("NAT-PMP server started", "listen_addr", cfg.ListenAddr)
 
 	// Start periodic reconciliation (every 1 minute)
 	go func() {
@@ -202,7 +96,7 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				if err := mappingService.ReconcileRules(); err != nil {
+				if err := mapper.ReconcileRules(); err != nil {
 					slog.Error("reconciliation failed", "error", err)
 				}
 			case <-ctx.Done():
@@ -218,12 +112,13 @@ func main() {
 	<-sigChan
 	slog.Info("Shutdown signal received, cleaning up...")
 
-	// Cancel context to stop server
+	// Cancel context to stop background tasks
 	cancel()
 
-	// Stop server
-	if err := server.Stop(); err != nil {
-		slog.Error("failed to stop server", "error", err)
+	// Stop NAT-PMP server
+	slog.Info("Stopping NAT-PMP server...")
+	if err := mapper.Stop(); err != nil {
+		slog.Error("failed to stop NAT-PMP server", "error", err)
 	}
 
 	// Delete all port mappings
@@ -231,7 +126,7 @@ func main() {
 
 	done := make(chan struct{})
 	go func() {
-		if err := mappingService.DeleteAll(); err != nil {
+		if err := mapper.DeleteAll(); err != nil {
 			slog.Error("failed to delete all mappings", "error", err)
 		}
 		close(done)

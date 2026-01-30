@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/features-not-bugs/mikrotik-double-natpmp/config"
@@ -155,6 +157,96 @@ func (c *Client) isPortAvailable(protocol string, port int) (bool, error) {
 
 	// Port is available if no rules were found
 	return len(reply.Re) == 0, nil
+}
+
+// getUsedPorts fetches all dst-nat ports currently in use on the interface for a given protocol
+func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
+	protocolLower := protocol
+	if protocol == "tcp" || protocol == "TCP" {
+		protocolLower = "tcp"
+	} else {
+		protocolLower = "udp"
+	}
+
+	// Query all dst-nat rules for this protocol on our interface
+	reply, err := c.client.Run(
+		"/ip/firewall/nat/print",
+		"?chain=dstnat",
+		"?protocol="+protocolLower,
+		"?in-interface="+c.config.LocalInInterface,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to query existing rules: %w", err)
+	}
+
+	usedPorts := make(map[int]bool)
+	for _, re := range reply.Re {
+		portStr := re.Map["dst-port"]
+		if portStr == "" {
+			continue
+		}
+
+		// Handle port ranges like "8080-8090" by marking all ports in range as used
+		// and simple ports like "8080"
+		if strings.Contains(portStr, "-") {
+			// Port range
+			parts := strings.Split(portStr, "-")
+			if len(parts) == 2 {
+				startPort, err1 := strconv.Atoi(parts[0])
+				endPort, err2 := strconv.Atoi(parts[1])
+				if err1 == nil && err2 == nil {
+					for p := startPort; p <= endPort; p++ {
+						usedPorts[p] = true
+					}
+				}
+			}
+		} else {
+			// Single port
+			port, err := strconv.Atoi(portStr)
+			if err == nil {
+				usedPorts[port] = true
+			}
+		}
+	}
+
+	return usedPorts, nil
+}
+
+// FindAvailablePort finds an available port starting from the suggested port
+// It fetches all used ports once and searches locally for efficiency
+func (c *Client) FindAvailablePort(protocol string, suggestedPort int) (int, error) {
+	const maxAttempts = 1000
+	const maxPort = 65535
+
+	// Fetch all used ports once
+	usedPorts, err := c.getUsedPorts(protocol)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get used ports: %w", err)
+	}
+
+	slog.Debug("Port availability check", "protocol", protocol, "used_ports_count", len(usedPorts))
+
+	// Start from suggested port, or from 49152 (dynamic port range) if 0
+	startPort := suggestedPort
+	if startPort == 0 {
+		startPort = 49152
+	}
+
+	// Search for available port
+	for i := 0; i < maxAttempts; i++ {
+		port := startPort + i
+		if port > maxPort {
+			// Wrap around to dynamic port range
+			port = 49152 + (port - maxPort - 1)
+		}
+
+		if !usedPorts[port] {
+			return port, nil
+		}
+	}
+
+	return 0, fmt.Errorf("no available ports found after %d attempts starting from port %d", maxAttempts, startPort)
 }
 
 // AddPortMapping creates a dst-nat rule for port forwarding with retry

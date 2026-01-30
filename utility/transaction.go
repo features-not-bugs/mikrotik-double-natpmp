@@ -1,4 +1,4 @@
-package mapping
+package utility
 
 import (
 	"fmt"
@@ -29,6 +29,10 @@ func (t *Transaction) Commit() error {
 	t.committed = true
 	t.rollbacks = nil
 	return nil
+}
+
+func (t *Transaction) Committed() bool {
+	return t.committed
 }
 
 // Rollback executes all rollback functions in reverse order
