@@ -4,58 +4,118 @@ A NAT-PMP (RFC 6886) server for double-NAT scenarios that synchronizes port mapp
 
 ## Overview
 
-This NAT-PMP server creates coordinated port mappings across two NAT layers, allowing clients behind a VPN-connected MikroTik router to receive incoming connections. The server handles:
+This NAT-PMP server creates coordinated port mappings across two NAT layers, allowing clients behind a VPN-connected MikroTik router to receive incoming connections.
 
-- **PUBLIC_ADDRESS** - Queries VPN gateway for external IP address
-- **MAP_UDP/MAP_TCP** - Creates persistent mappings on MikroTik router and time-limited mappings on VPN gateway
-- **Mapping renewals** - Allows clients to issue port mapping renewals
+```
+                                    Internet
+                                        │
+                                   VPN Gateway (NAT-PMP)
+                                        │
+┌───────────────────────────────────────┼───────────────────────────────────────┐
+│ MikroTik Router                       │                                       │
+│                              ┌────────┴────────┐                              │
+│                              │  WireGuard/VPN  │                              │
+│                              │   Interface     │                              │
+│                              └────────┬────────┘                              │
+│                                       │                                       │
+│                              ┌────────┴────────┐                              │
+│                              │  double-natpmp  │◄─── This service             │
+│                              │     :5351       │                              │
+│                              └────────┬────────┘                              │
+│                                       │                                       │
+└───────────────────────────────────────┼───────────────────────────────────────┘
+                                        │
+                                   LAN Clients
+                              (NAT-PMP requests)
+```
+
+## Quick Start
+
+```bash
+# Build
+go build -o double-natpmp
+
+# Run
+VPN_GATEWAY=10.2.0.1 \
+MIKROTIK_API_ADDRESS=192.168.1.254:8728 \
+MIKROTIK_API_PASSWORD=your-password \
+./double-natpmp
+```
 
 ## Configuration
 
-Required environment variables:
+### Required
 
-- `VPN_GATEWAY` - VPN gateway IP address (e.g., `10.2.0.1`)
-- `MIKROTIK_API_ADDRESS` - MikroTik API endpoint (e.g., `192.168.1.254:8728`)
-- `MIKROTIK_API_PASSWORD` - MikroTik API password
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `VPN_GATEWAY` | VPN gateway IP address | `10.2.0.1` |
+| `MIKROTIK_API_ADDRESS` | MikroTik API endpoint | `192.168.1.254:8728` |
+| `MIKROTIK_API_PASSWORD` | MikroTik API password | - |
 
-Optional environment variables:
+### Optional
 
-- `LISTEN_ADDR` - NAT-PMP listen address (default: `:5351`)
-- `MIKROTIK_API_USER` - MikroTik API username (default: `admin`)
-- `MIKROTIK_API_TLS` - Use TLS for API connection (default: `false`)
-- `MIKROTIK_IN_INTERFACE` - Interface for dst-nat rules (default: auto-detected from VPN route)
-- `LOG_LEVEL` - Logging level: `DEBUG`, `INFO`, `WARN`, `ERROR` (default: `INFO`)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LISTEN_ADDR` | NAT-PMP listen address | `:5351` |
+| `MIKROTIK_API_USER` | MikroTik API username | `admin` |
+| `MIKROTIK_API_TLS` | Use TLS for API connection | `false` |
+| `MIKROTIK_IN_INTERFACE` | Interface for dst-nat rules | auto-detected |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 
 ## Features
 
-- **RFC 6886 compliant** - Full NAT-PMP protocol implementation including idempotent deletions
+- **RFC 6886 compliant** - Full NAT-PMP protocol implementation
 - **Double-NAT orchestration** - Synchronized mappings across both NAT layers
-- **Automatic interface detection** - Determines correct MikroTik interface from VPN gateway routing
-- **Client-driven lifecycle** - Server returns VPN's actual lifetime (e.g., 60s), client manages renewals
-- **Port conflict prevention** - Validates port availability before creating mappings
-- **Transaction rollback** - Automatic cleanup on failures
-- **Queue-per-port serialization** - Prevents concurrent processing of requests for the same port
-- **Periodic reconciliation** - Removes expired mappings and stale MikroTik rules every minute
+- **Automatic interface detection** - Determines MikroTik interface from VPN gateway routing
+- **Connection pooling** - 4 concurrent MikroTik API connections for parallel operations
+- **Per-mapping serialization** - Concurrent requests for different ports run in parallel; same-port requests are serialized
+- **Transaction rollback** - Automatic cleanup if mapping creation fails partway
+- **Periodic reconciliation** - Removes orphaned MikroTik rules every 10 minutes
 - **Graceful shutdown** - Cleanup of all mappings on termination
-- **PCP fallback support** - Returns `UNSUPP_VERSION` for Port Control Protocol clients to trigger NAT-PMP fallback
-- **Concurrency-safe** - Proper locking patterns prevent race conditions
+- **Rate limiting** - Maximum 100 concurrent request handlers
+- **Auto-reconnection** - Recovers from MikroTik API connection failures
 
-## Architecture
+## How It Works
 
+### Port Mapping Flow
+
+1. Client sends NAT-PMP mapping request to this server
+2. Server creates **persistent** dst-nat rule on MikroTik router
+3. Server forwards request to VPN gateway NAT-PMP server
+4. VPN gateway returns granted lifetime (often shorter, e.g., 60s)
+5. Server returns VPN's actual lifetime to client
+6. Client renews before expiration; server only refreshes VPN mapping (MikroTik rule persists)
+
+### Why Two Mappings?
+
+| Layer | Mapping | Lifetime | Purpose |
+|-------|---------|----------|---------|
+| MikroTik | dst-nat rule | Persistent | Forward traffic from VPN interface to LAN client |
+| VPN Gateway | NAT-PMP mapping | Time-limited | Forward traffic from internet to VPN tunnel |
+
+The MikroTik rule persists because it's cheap and the server tracks it. The VPN mapping has a short lifetime (set by the VPN provider), requiring client-driven renewals.
+
+## MikroTik Setup
+
+The service creates dst-nat rules with comments prefixed `double-natpmp-`. Ensure your MikroTik API user has permissions to:
+
+- Read/write `/ip/firewall/nat`
+- Read `/ip/route` (for interface auto-detection)
+
+Example MikroTik user setup:
 ```
-Client → NAT-PMP Server → Mapping Service
-                              ├─→ MikroTik API → Local Router (persistent rules)
-                              └─→ NAT-PMP Client → VPN Gateway (time-limited mappings)
+/user group add name=natpmp policy=read,write,test,api,!ftp,!reboot,!policy,!sensitive
+/user add name=natpmp group=natpmp password=your-password
 ```
 
-### Mapping Lifecycle
+The `test` policy is required for `/ip/route/check` (interface auto-detection).
 
-1. Client requests mapping with desired lifetime
-2. Server creates persistent dst-nat rule on MikroTik router
-3. Server forwards request to VPN gateway (may receive shorter lifetime, e.g., 60s)
-4. Server returns VPN's actual granted lifetime to client
-5. Client sees actual lifetime and initiates renewal before expiration
-6. On renewal, server only refreshes VPN mapping (MikroTik rule persists)
-7. On expiration without renewal, periodic reconciliation removes stale mappings
+## Building
 
-This design allows the MikroTik router rules to persist while VPN gateway mappings are renewed as needed based on the gateway's lifetime policy.
+```bash
+go build -o double-natpmp
+```
+
+## License
+
+MIT

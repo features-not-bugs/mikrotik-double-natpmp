@@ -145,7 +145,8 @@ func (c *Client) Close() error {
 func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
 	reply, err := c.run(
 		"/ip/route/check",
-		"=dst-address="+gateway,
+		"=dst-ip="+gateway,
+		"=once",
 	)
 
 	if err != nil {
