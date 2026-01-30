@@ -42,7 +42,7 @@ func (c *Client) GetExternalAddress() (*ExternalAddressResponse, error) {
 
 	opCode := responseData[1]
 	if opCode != byte(opcodePublicAddress)|0x80 {
-		return nil, fmt.Errorf("invalid opcode response: %d bytes", opCode)
+		return nil, fmt.Errorf("invalid opcode in response: %d", opCode)
 	}
 
 	response := &ExternalAddressResponse{}

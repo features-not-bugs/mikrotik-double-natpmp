@@ -137,7 +137,7 @@ type ExternalAddressResponse struct {
 }
 
 func (e *ExternalAddressResponse) toBytes() []byte {
-	bytes := make([]byte, 16)
+	bytes := make([]byte, 12)
 	// Version
 	bytes[0] = 0
 	// OpCode
@@ -146,8 +146,11 @@ func (e *ExternalAddressResponse) toBytes() []byte {
 	binary.BigEndian.PutUint16(bytes[2:4], uint16(e.ResultCode))
 	// Epoch
 	binary.BigEndian.PutUint32(bytes[4:8], e.Epoch)
-	// External Address
-	copy(bytes[8:12], e.ExternalAddress)
+	// External Address (must be 4-byte IPv4)
+	ip4 := e.ExternalAddress.To4()
+	if ip4 != nil {
+		copy(bytes[8:12], ip4)
+	}
 
 	return bytes
 }
@@ -158,6 +161,7 @@ func (e *ExternalAddressResponse) fromBytes(bytes []byte) error {
 	}
 	e.ResultCode = Result(binary.BigEndian.Uint16(bytes[2:4]))
 	e.Epoch = binary.BigEndian.Uint32(bytes[4:8])
-	e.ExternalAddress = bytes[8:12]
+	e.ExternalAddress = make(net.IP, 4)
+	copy(e.ExternalAddress, bytes[8:12])
 	return nil
 }

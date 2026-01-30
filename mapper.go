@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -12,6 +11,8 @@ import (
 	"github.com/features-not-bugs/mikrotik-double-natpmp/natpmp"
 	"github.com/features-not-bugs/mikrotik-double-natpmp/utility"
 )
+
+var slog = utility.GetLogger().With("component", "mapper")
 
 // mapping represents a complete double-NAT port mapping
 type mapping struct {
@@ -151,6 +152,8 @@ func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressR
 			Epoch:           uint32(time.Now().Unix()),
 			ExternalAddress: net.IPv4(0, 0, 0, 0),
 		}
+	} else {
+		slog.Info("Handled external address request", "external_address", response.ExternalAddress)
 	}
 	return response
 }
@@ -159,7 +162,7 @@ func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressR
 func (s *mapper) handlePortMapping(request *natpmp.PortMappingRequest, remoteIP net.IP) *natpmp.PortMappingResponse {
 	clientIP := remoteIP.String()
 
-	slog.Info("Port mapping request",
+	slog.Debug("Port mapping request",
 		"client_ip", clientIP,
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort,
@@ -213,7 +216,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 	// Step 1: Create mapping on local router via MikroTik API
 	protocolStr := protocolToString(request.Protocol)
 
-	slog.Info("Sending to local gateway (MikroTik)",
+	slog.Debug("Sending to local gateway (MikroTik)",
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort,
 		"suggested_external_port", request.SuggestedExternalPort)
@@ -229,7 +232,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 
 	// If the suggested port is unavailable, find an available port
 	if err != nil && (request.SuggestedExternalPort != 0) {
-		slog.Info("Suggested port unavailable, searching for alternative",
+		slog.Debug("Suggested port unavailable, searching for alternative",
 			"suggested_port", request.SuggestedExternalPort,
 			"error", err)
 
@@ -244,7 +247,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 			}
 		}
 
-		slog.Info("Found available port", "port", availablePort)
+		slog.Debug("Found available port", "port", availablePort)
 
 		// Retry with available port
 		localResult, err = s.mikrotik.AddPortMapping(
@@ -266,20 +269,20 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 		}
 	}
 
-	slog.Info("Received from local gateway (MikroTik)",
+	slog.Debug("Received from local gateway (MikroTik)",
 		"assigned_external_port", localResult.ExternalPort,
 		"rule_id", localResult.RuleID)
 
 	// Add rollback for local mapping
 	tx.AddRollback(func() error {
-		slog.Info("Rolling back local port mapping",
+		slog.Debug("Rolling back local port mapping",
 			"internal_port", request.InternalPort,
 			"external_port", localResult.ExternalPort)
 		return s.mikrotik.DeletePortMappingByID(localResult.RuleID)
 	})
 
 	// Step 2: Create mapping on VPN gateway
-	slog.Info("Sending to VPN gateway",
+	slog.Debug("Sending to VPN gateway",
 		"protocol", protocolName(request.Protocol),
 		"internal_port", localResult.ExternalPort)
 
@@ -301,13 +304,13 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 		}
 	}
 
-	slog.Info("Received from VPN gateway",
+	slog.Debug("Received from VPN gateway",
 		"assigned_external_port", vpnResult.ExternalPort,
 		"granted_lifetime", vpnResult.Lifetime)
 
 	// Add rollback for VPN mapping
 	tx.AddRollback(func() error {
-		slog.Info("Rolling back VPN port mapping",
+		slog.Debug("Rolling back VPN port mapping",
 			"internal_port", localResult.ExternalPort,
 			"external_port", vpnResult.ExternalPort)
 		deleteReq := &natpmp.PortMappingRequest{
@@ -339,11 +342,11 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 	// Commit transaction
 	tx.Commit()
 
-	slog.Info("Port opened",
+	slog.Info("Mapped port",
+		"client", clientIP,
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort,
-		"local_external_port", localResult.ExternalPort,
-		"vpn_external_port", vpnResult.ExternalPort,
+		"external_port", vpnResult.ExternalPort,
 		"lifetime", vpnResult.Lifetime)
 
 	return &natpmp.PortMappingResponse{
@@ -407,7 +410,8 @@ func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, c
 			"internal_port", mappingCopy.LocalExternalPort)
 	}
 
-	slog.Info("Port closed",
+	slog.Info("Unmapped port",
+		"client", clientIP,
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort)
 
@@ -423,7 +427,7 @@ func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, c
 
 // handlePortMappingRenewal renews an existing port mapping
 func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.PortMappingRequest) *natpmp.PortMappingResponse {
-	slog.Info("Client renewal request",
+	slog.Debug("Client renewal request",
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort,
 		"lifetime", request.RequestedLifetimeInSeconds)
@@ -480,10 +484,10 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 		slog.Debug("Updated expiration timer", "expires_in", duration)
 	}
 
-	slog.Info("Renewal successful",
+	slog.Info("Mapping renewed",
+		"client", mapping.ClientIP,
 		"protocol", protocolName(request.Protocol),
 		"internal_port", request.InternalPort,
-		"vpn_external_port", vpnResult.ExternalPort,
 		"lifetime", vpnResult.Lifetime)
 
 	return &natpmp.PortMappingResponse{
@@ -518,13 +522,10 @@ func (s *mapper) addMapping(mapping *mapping) {
 
 	s.mappings[key] = mapping
 
-	slog.Info("Added mapping to state",
+	slog.Debug("Added mapping to state",
 		"client_ip", mapping.ClientIP,
 		"protocol", protocolName(mapping.Protocol),
 		"internal_port", mapping.InternalPort,
-		"local_external_port", mapping.LocalExternalPort,
-		"vpn_external_port", mapping.VpnExternalPort,
-		"mikrotik_rule_id", mapping.MikroTikRuleID,
 		"expires_in", duration)
 }
 
@@ -547,11 +548,10 @@ func (s *mapper) expireMapping(k key) {
 	delete(s.mappings, k)
 	s.mu.Unlock()
 
-	// Cleanup external resources
-	slog.Info("Mapping expired, cleaning up",
+	slog.Info("Mapping expired",
+		"client", mappingCopy.ClientIP,
 		"protocol", protocolName(mappingCopy.Protocol),
-		"internal_port", mappingCopy.InternalPort,
-		"client_ip", mappingCopy.ClientIP)
+		"internal_port", mappingCopy.InternalPort)
 
 	// Delete from local MikroTik using rule ID
 	if err := s.mikrotik.DeletePortMappingByID(mappingCopy.MikroTikRuleID); err != nil {

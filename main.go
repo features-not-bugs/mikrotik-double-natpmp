@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -40,7 +39,7 @@ func main() {
 
 	// Auto-detect interface if not configured
 	if cfg.LocalInInterface == "" {
-		slog.Info("Auto-detecting interface for VPN gateway", "gateway", cfg.VpnGateway.String())
+		slog.Debug("Auto-detecting interface for VPN gateway", "gateway", cfg.VpnGateway)
 		detectedInterface, err := mikroTikClient.GetInterfaceForGateway(cfg.VpnGateway.String())
 		if err != nil {
 			slog.Warn("Failed to auto-detect interface, using 'bridge' as default", "error", err)

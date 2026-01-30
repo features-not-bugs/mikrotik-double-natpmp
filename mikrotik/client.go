@@ -330,7 +330,7 @@ func (c *Client) addPortMapping(protocol string, internalPort, externalPort int,
 		result.ExternalPort = uint16(internalPort)
 	}
 
-	slog.Info("MikroTik dst-nat rule created", "rule_id", ruleID, "external_port", result.ExternalPort)
+	slog.Debug("MikroTik dst-nat rule created", "rule_id", ruleID, "external_port", result.ExternalPort)
 
 	return result, nil
 }
@@ -365,7 +365,7 @@ func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress 
 		return fmt.Errorf("failed to delete dst-nat rule: %w", err)
 	}
 
-	slog.Info("MikroTik dst-nat rule deleted", "rule_id", ruleID)
+	slog.Debug("MikroTik dst-nat rule deleted", "rule_id", ruleID)
 
 	return nil
 }
@@ -381,7 +381,7 @@ func (c *Client) DeletePortMappingByID(ruleID string) error {
 		return fmt.Errorf("failed to delete dst-nat rule: %w", err)
 	}
 
-	slog.Info("MikroTik dst-nat rule deleted", "rule_id", ruleID)
+	slog.Debug("MikroTik dst-nat rule deleted", "rule_id", ruleID)
 
 	return nil
 }
@@ -441,7 +441,7 @@ func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
 		}
 	}
 
-	slog.Info("Found existing double-natpmp rules", "count", len(rules))
+	slog.Debug("Found existing double-natpmp rules", "count", len(rules))
 
 	return rules, nil
 }
