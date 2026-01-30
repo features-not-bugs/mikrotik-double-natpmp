@@ -116,11 +116,13 @@ func (s *mapper) handlePortMapping(request *natpmp.PortMappingRequest, remoteIP 
 
 	s.mu.RLock()
 	existingMapping, isRenewal := s.mappings[key]
-	s.mu.RUnlock()
-
 	if isRenewal {
-		return s.handlePortMappingRenewal(existingMapping, request)
+		// Copy the mapping data while holding the lock to avoid races
+		mappingCopy := *existingMapping
+		s.mu.RUnlock()
+		return s.handlePortMappingRenewal(&mappingCopy, request)
 	}
+	s.mu.RUnlock()
 
 	// Create new mapping
 	return s.handlePortMappingCreation(request, clientIP)
@@ -290,22 +292,25 @@ func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, c
 		InternalPort: request.InternalPort,
 	}
 
+	// Copy mapping data while holding lock, then delete
 	s.mu.Lock()
-	mapping, exists := s.mappings[key]
+	existingMapping, exists := s.mappings[key]
+	var mappingCopy mapping
 	if exists {
+		mappingCopy = *existingMapping // Copy before releasing lock
 		delete(s.mappings, key)
 	}
-	s.mu.Unlock()
+	s.mu.Unlock() // Note: Using defer here would hold lock during external API calls below
 
 	if exists {
 		protocolStr := protocolToString(request.Protocol)
 
 		s.mikrotik.DeletePortMapping(protocolStr, int(request.InternalPort), clientIP)
 
-		// Delete VPN mapping
+		// Delete VPN mapping - use copied data
 		deleteReq := &natpmp.PortMappingRequest{
 			Protocol:                   request.Protocol,
-			InternalPort:               mapping.LocalExternalPort,
+			InternalPort:               mappingCopy.LocalExternalPort,
 			SuggestedExternalPort:      0,
 			RequestedLifetimeInSeconds: 0,
 		}
@@ -355,6 +360,8 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 
 	// Update mapping
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	key := key{
 		ClientIP:     mapping.ClientIP.String(),
 		Protocol:     request.Protocol,
@@ -365,7 +372,6 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 		m.ExpiresAt = time.Now().Add(time.Duration(vpnResult.Lifetime) * time.Second)
 		m.VpnExternalPort = vpnResult.ExternalPort
 	}
-	s.mu.Unlock()
 
 	slog.Info("Renewal successful",
 		"protocol", protocolName(request.Protocol),
@@ -428,7 +434,7 @@ func (s *mapper) ReconcileRules() error {
 			trackedRules[mapping.MikroTikRuleID] = true
 		}
 	}
-	s.mu.RUnlock()
+	s.mu.RUnlock() // Note: defer not used to minimize lock hold time during rule iteration
 
 	// Check each rule against our state
 	removedCount := 0
@@ -493,7 +499,7 @@ func (s *mapper) cleanupExpiredMappings() {
 	for _, expired := range expiredMappings {
 		delete(s.mappings, expired.key)
 	}
-	s.mu.Unlock()
+	s.mu.Unlock() // Note: defer not used to avoid holding lock during external API calls below
 
 	// Second pass: cleanup external resources without holding lock
 	for _, expired := range expiredMappings {
@@ -531,7 +537,7 @@ func (s *mapper) DeleteAll() error {
 	}
 	// Clear the map
 	s.mappings = make(map[key]*mapping)
-	s.mu.Unlock()
+	s.mu.Unlock() // Note: defer not used to avoid holding lock during external API calls below
 
 	slog.Info("Deleting all mappings", "count", len(mappingsToDelete))
 

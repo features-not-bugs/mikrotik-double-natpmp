@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -62,73 +61,27 @@ func (c *Client) Close() error {
 
 // GetInterfaceForGateway determines which interface would be used to reach the gateway
 func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
-	// Query all active routes
+	// Use /ip/route/check to determine the actual route that would be used
 	reply, err := c.client.Run(
-		"/ip/route/print",
-		"?active=yes",
+		"/ip/route/check",
+		"=dst-address="+gateway,
 	)
 
 	if err != nil {
-		return "", fmt.Errorf("failed to query routes: %w", err)
+		return "", fmt.Errorf("failed to check route: %w", err)
 	}
 
-	// Parse the gateway IP to compare with route destinations
-	// We need to find which route would be used to reach this specific IP
-	var bestMatch string
-	var bestPrefixLen int = -1
-
-	for _, re := range reply.Re {
-		dstAddr := re.Map["dst-address"]
-		if dstAddr == "" {
-			continue
-		}
-
-		// Check if the gateway IP falls within this route's destination
-		// For routes that could match our gateway, prefer the most specific (longest prefix)
-		if c.ipMatchesRoute(gateway, dstAddr) {
-			prefixLen := c.getRoutePrefixLength(dstAddr)
-			if prefixLen > bestPrefixLen {
-				bestPrefixLen = prefixLen
-				// Use gateway-interface if available, otherwise use routing-mark interface
-				if iface := re.Map["gateway-interface"]; iface != "" {
-					bestMatch = iface
-				}
-			}
-		}
+	if len(reply.Re) == 0 {
+		return "", fmt.Errorf("no route found for gateway %s", gateway)
 	}
 
-	if bestMatch != "" {
-		return bestMatch, nil
+	// The interface field tells us which interface would be used
+	iface := reply.Re[0].Map["interface"]
+	if iface == "" {
+		return "", fmt.Errorf("no interface found in route check for gateway %s", gateway)
 	}
 
-	return "", fmt.Errorf("could not determine interface for gateway %s", gateway)
-}
-
-// ipMatchesRoute checks if an IP address falls within a CIDR range
-func (c *Client) ipMatchesRoute(ip, cidr string) bool {
-	// Parse the IP
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
-		return false
-	}
-
-	// Parse the CIDR
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-
-	return ipNet.Contains(parsedIP)
-}
-
-// getRoutePrefixLength extracts the prefix length from a CIDR notation
-func (c *Client) getRoutePrefixLength(cidr string) int {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return 0
-	}
-	ones, _ := ipNet.Mask.Size()
-	return ones
+	return iface, nil
 }
 
 // isPortAvailable checks if a dst-port is already in use by any dst-nat rule

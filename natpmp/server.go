@@ -6,6 +6,7 @@ import (
 	"errors"
 	gslog "log/slog"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type Server struct {
 	conn                   *net.UDPConn
 	externalAddressHandler ExternalAddressHandler
 	portMappingHandler     PortMappingHandler
+	mu                     sync.RWMutex // Protects conn
 }
 
 // NewServer creates a new NAT-PMP server
@@ -42,7 +44,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	s.mu.Lock()
 	s.conn = conn
+	s.mu.Unlock() // Note: defer not used for minimal lock hold time
 
 	go s.serve(ctx)
 	return nil
@@ -50,6 +55,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Stop stops the server
 func (s *Server) Stop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.conn != nil {
 		return s.conn.Close()
 	}
@@ -68,14 +76,23 @@ func (s *Server) serve(ctx context.Context) {
 		default:
 		}
 
+		// Get conn with lock protection
+		s.mu.RLock()
+		conn := s.conn
+		s.mu.RUnlock() // Note: defer not used for minimal lock hold time in hot loop
+
+		if conn == nil {
+			return
+		}
+
 		// Set read timeout
-		err := s.conn.SetReadDeadline(time.Now().Add(time.Second))
+		err := conn.SetReadDeadline(time.Now().Add(time.Second))
 		if err != nil {
 			slog.Error("failed to set read deadline when listening for natpmp messages", "error", err)
 			continue
 		}
 
-		n, remoteAddr, err := s.conn.ReadFromUDP(buffer)
+		n, remoteAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
@@ -164,8 +181,17 @@ func (s *Server) handleRequest(data []byte, remoteAddr *net.UDPAddr) {
 }
 
 func (s *Server) sendResponse(response []byte, remoteAddr *net.UDPAddr) {
-	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err := s.conn.WriteToUDP(response, remoteAddr)
+	s.mu.RLock()
+	conn := s.conn
+	s.mu.RUnlock() // Note: defer not used for minimal lock hold time
+
+	if conn == nil {
+		slog.Error("connection closed, cannot send response", "to", remoteAddr)
+		return
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_, err := conn.WriteToUDP(response, remoteAddr)
 	if err != nil {
 		slog.Error("failed to send response to client", "error", err, "to", remoteAddr)
 	}
