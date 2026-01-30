@@ -49,6 +49,10 @@ type PortMappingResponse struct {
 }
 
 func (p *PortMappingResponse) toBytes() []byte {
+	if p == nil {
+		return nil
+	}
+
 	bytes := make([]byte, 16)
 	// Version
 	bytes[0] = 0
@@ -89,6 +93,10 @@ type PortMappingRequest struct {
 }
 
 func (p *PortMappingRequest) toBytes() []byte {
+	if p == nil {
+		return nil
+	}
+
 	bytes := make([]byte, 12)
 	// Version
 	bytes[0] = 0
@@ -137,6 +145,10 @@ type ExternalAddressResponse struct {
 }
 
 func (e *ExternalAddressResponse) toBytes() []byte {
+	if e == nil {
+		return nil
+	}
+
 	bytes := make([]byte, 12)
 	// Version
 	bytes[0] = 0

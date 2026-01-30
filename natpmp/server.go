@@ -191,8 +191,6 @@ func (s *Server) handleRequest(data []byte, remoteAddr *net.UDPAddr) {
 	// Send response
 	if response != nil {
 		s.sendResponse(response, remoteAddr)
-	} else {
-		slog.Error("no response generated for request", "opcode", opcode, "from", remoteAddr)
 	}
 }
 

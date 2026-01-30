@@ -147,13 +147,7 @@ func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressR
 	response, err := s.vpnGatewayNATClient.GetExternalAddress()
 	if err != nil {
 		slog.Error("failed to request external address from vpn gateway", "client_ip", clientIP, "error", err)
-		response = &natpmp.ExternalAddressResponse{
-			ResultCode:      natpmp.ResultNetworkFailure,
-			Epoch:           uint32(time.Now().Unix()),
-			ExternalAddress: net.IPv4(0, 0, 0, 0),
-		}
-	} else {
-		slog.Info("Handled external address request", "external_address", response.ExternalAddress)
+		return nil
 	}
 	return response
 }
@@ -231,6 +225,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 	)
 
 	// If the suggested port is unavailable, find an available port
+	// bold assumption the err is because of the port..
 	if err != nil && (request.SuggestedExternalPort != 0) {
 		slog.Debug("Suggested port unavailable, searching for alternative",
 			"suggested_port", request.SuggestedExternalPort,
@@ -261,12 +256,13 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 
 	if err != nil {
 		slog.Error("Local gateway failed", "error", err)
-		return &natpmp.PortMappingResponse{
-			Protocol:     request.Protocol,
-			ResultCode:   natpmp.ResultNetworkFailure,
-			Epoch:        uint32(time.Now().Unix()),
-			InternalPort: request.InternalPort,
-		}
+		return nil
+		//return &natpmp.PortMappingResponse{
+		//	Protocol:     request.Protocol,
+		//	ResultCode:   natpmp.ResultNetworkFailure,
+		//	Epoch:        uint32(time.Now().Unix()),
+		//	InternalPort: request.InternalPort,
+		//}
 	}
 
 	slog.Debug("Received from local gateway (MikroTik)",
@@ -289,19 +285,20 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 	vpnRequest := &natpmp.PortMappingRequest{
 		Protocol:                   request.Protocol,
 		InternalPort:               localResult.ExternalPort,
-		SuggestedExternalPort:      0,
+		SuggestedExternalPort:      request.SuggestedExternalPort,
 		RequestedLifetimeInSeconds: request.RequestedLifetimeInSeconds,
 	}
 
 	vpnResult, err := s.vpnGatewayNATClient.SendPortMappingRequest(vpnRequest)
 	if err != nil {
 		slog.Error("VPN gateway failed", "error", err)
-		return &natpmp.PortMappingResponse{
-			Protocol:     request.Protocol,
-			ResultCode:   natpmp.ResultNetworkFailure,
-			Epoch:        uint32(time.Now().Unix()),
-			InternalPort: request.InternalPort,
-		}
+		return nil
+		//return &natpmp.PortMappingResponse{
+		//	Protocol:     request.Protocol,
+		//	ResultCode:   natpmp.ResultNetworkFailure,
+		//	Epoch:        uint32(time.Now().Unix()),
+		//	InternalPort: request.InternalPort,
+		//}
 	}
 
 	slog.Debug("Received from VPN gateway",
@@ -444,12 +441,13 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 	vpnResult, err := s.vpnGatewayNATClient.SendPortMappingRequest(vpnRequest)
 	if err != nil {
 		slog.Error("VPN renewal failed", "error", err)
-		return &natpmp.PortMappingResponse{
-			Protocol:     request.Protocol,
-			ResultCode:   natpmp.ResultNetworkFailure,
-			Epoch:        uint32(time.Now().Unix()),
-			InternalPort: request.InternalPort,
-		}
+		return nil
+		//return &natpmp.PortMappingResponse{
+		//	Protocol:     request.Protocol,
+		//	ResultCode:   natpmp.ResultNetworkFailure,
+		//	Epoch:        uint32(time.Now().Unix()),
+		//	InternalPort: request.InternalPort,
+		//}
 	}
 
 	// Update mapping
