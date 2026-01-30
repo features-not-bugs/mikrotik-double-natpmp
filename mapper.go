@@ -149,6 +149,9 @@ func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressR
 		slog.Error("failed to request external address from vpn gateway", "client_ip", clientIP, "error", err)
 		return nil
 	}
+	slog.Info("Retrieved external address",
+		"client", clientIP,
+		"external_address", response.ExternalAddress)
 	return response
 }
 
