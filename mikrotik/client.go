@@ -3,23 +3,32 @@ package mikrotik
 import (
 	"context"
 	"fmt"
-	gslog "log/slog"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/features-not-bugs/mikrotik-double-natpmp/config"
+	"github.com/features-not-bugs/mikrotik-double-natpmp/utility"
 	"github.com/go-routeros/routeros/v3"
 )
 
-var slog = gslog.Default().With("component", "natpmp-client")
+var slog = utility.GetLogger().With("component", "mikrotik-client")
 
-// Client wraps the MikroTik RouterOS API client
+const (
+	defaultPoolSize   = 4
+	connectionTimeout = 10 * time.Second
+)
+
+// pooledConn wraps a routeros.Client with health tracking
+type pooledConn struct {
+	client    *routeros.Client
+	lastError time.Time
+}
+
+// Client wraps the MikroTik RouterOS API client with connection pooling
 type Client struct {
-	client *routeros.Client
 	config *config.Config
-	mu     sync.Mutex // Protects concurrent API calls
+	pool   chan *pooledConn
 }
 
 // PortMappingResult represents the result of creating a port mapping
@@ -29,47 +38,112 @@ type PortMappingResult struct {
 	Lifetime     uint32
 }
 
-// NewClient creates a new MikroTik API client
+// NewClient creates a new MikroTik API client with connection pooling
 func NewClient(cfg *config.Config) (*Client, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	c := &Client{
+		config: cfg,
+		pool:   make(chan *pooledConn, defaultPoolSize),
+	}
+
+	// Create initial connections
+	for i := 0; i < defaultPoolSize; i++ {
+		conn, err := c.dial()
+		if err != nil {
+			// Close any connections we've already made
+			c.Close()
+			return nil, fmt.Errorf("failed to create connection pool: %w", err)
+		}
+		c.pool <- conn
+	}
+
+	slog.Info("Connected to MikroTik API",
+		"address", cfg.LocalAPIAddress,
+		"tls", cfg.LocalAPIUseTLS,
+		"pool_size", defaultPoolSize)
+
+	return c, nil
+}
+
+// dial creates a new connection to the MikroTik router
+func (c *Client) dial() (*pooledConn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
 	defer cancel()
 
 	var client *routeros.Client
 	var err error
 
-	if cfg.LocalAPIUseTLS {
-		client, err = routeros.DialTLSContext(ctx, cfg.LocalAPIAddress, cfg.LocalAPIUser, cfg.LocalAPIPassword, nil)
+	if c.config.LocalAPIUseTLS {
+		client, err = routeros.DialTLSContext(ctx, c.config.LocalAPIAddress, c.config.LocalAPIUser, c.config.LocalAPIPassword, nil)
 	} else {
-		client, err = routeros.DialContext(ctx, cfg.LocalAPIAddress, cfg.LocalAPIUser, cfg.LocalAPIPassword)
+		client, err = routeros.DialContext(ctx, c.config.LocalAPIAddress, c.config.LocalAPIUser, c.config.LocalAPIPassword)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MikroTik API: %w", err)
+		return nil, err
 	}
 
-	slog.Info("Connected to MikroTik API", "address", cfg.LocalAPIAddress, "tls", cfg.LocalAPIUseTLS)
-
-	return &Client{
-		client: client,
-		config: cfg,
-	}, nil
+	return &pooledConn{client: client}, nil
 }
 
-// Close closes the MikroTik API connection
+// acquire gets a connection from the pool
+func (c *Client) acquire() *pooledConn {
+	return <-c.pool
+}
+
+// release returns a connection to the pool, reconnecting if needed
+func (c *Client) release(conn *pooledConn, err error) {
+	if err != nil {
+		// Connection may be bad, try to reconnect
+		conn.client.Close()
+
+		newConn, dialErr := c.dial()
+		if dialErr != nil {
+			slog.Warn("Failed to reconnect to MikroTik, will retry on next use", "error", dialErr)
+			// Put a marker back so pool doesn't shrink
+			conn.client = nil
+			conn.lastError = time.Now()
+			c.pool <- conn
+			return
+		}
+		conn = newConn
+	}
+	c.pool <- conn
+}
+
+// run executes an API command with automatic connection management
+func (c *Client) run(args ...string) (*routeros.Reply, error) {
+	conn := c.acquire()
+
+	// Check if this connection needs reconnection (from previous error)
+	if conn.client == nil {
+		// Try to reconnect
+		newConn, err := c.dial()
+		if err != nil {
+			c.pool <- conn // Return the bad conn marker
+			return nil, fmt.Errorf("connection unavailable: %w", err)
+		}
+		conn = newConn
+	}
+
+	reply, err := conn.client.Run(args...)
+	c.release(conn, err)
+	return reply, err
+}
+
+// Close closes all connections in the pool
 func (c *Client) Close() error {
-	if c.client != nil {
-		c.client.Close()
+	close(c.pool)
+	for conn := range c.pool {
+		if conn.client != nil {
+			conn.client.Close()
+		}
 	}
 	return nil
 }
 
 // GetInterfaceForGateway determines which interface would be used to reach the gateway
 func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Use /ip/route/check to determine the actual route that would be used
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/route/check",
 		"=dst-address="+gateway,
 	)
@@ -82,7 +156,6 @@ func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
 		return "", fmt.Errorf("no route found for gateway %s", gateway)
 	}
 
-	// The interface field tells us which interface would be used
 	iface := reply.Re[0].Map["interface"]
 	if iface == "" {
 		return "", fmt.Errorf("no interface found in route check for gateway %s", gateway)
@@ -93,25 +166,10 @@ func (c *Client) GetInterfaceForGateway(gateway string) (string, error) {
 
 // isPortAvailable checks if a dst-port is already in use by any dst-nat rule
 func (c *Client) isPortAvailable(protocol string, port int) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.isPortAvailableLocked(protocol, port)
-}
-
-// isPortAvailableLocked is the internal version that assumes mutex is already held
-func (c *Client) isPortAvailableLocked(protocol string, port int) (bool, error) {
-	protocolLower := protocol
-	if protocol == "tcp" || protocol == "TCP" {
-		protocolLower = "tcp"
-	} else {
-		protocolLower = "udp"
-	}
-
+	protocolLower := normalizeProtocol(protocol)
 	portStr := fmt.Sprintf("%d", port)
 
-	// Query all dst-nat rules matching this protocol and port on our interface
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/firewall/nat/print",
 		"?chain=dstnat",
 		"?protocol="+protocolLower,
@@ -123,24 +181,14 @@ func (c *Client) isPortAvailableLocked(protocol string, port int) (bool, error) 
 		return false, fmt.Errorf("failed to query existing rules: %w", err)
 	}
 
-	// Port is available if no rules were found
 	return len(reply.Re) == 0, nil
 }
 
 // getUsedPorts fetches all dst-nat ports currently in use on the interface for a given protocol
 func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	protocolLower := normalizeProtocol(protocol)
 
-	protocolLower := protocol
-	if protocol == "tcp" || protocol == "TCP" {
-		protocolLower = "tcp"
-	} else {
-		protocolLower = "udp"
-	}
-
-	// Query all dst-nat rules for this protocol on our interface
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/firewall/nat/print",
 		"?chain=dstnat",
 		"?protocol="+protocolLower,
@@ -158,10 +206,7 @@ func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
 			continue
 		}
 
-		// Handle port ranges like "8080-8090" by marking all ports in range as used
-		// and simple ports like "8080"
 		if strings.Contains(portStr, "-") {
-			// Port range
 			parts := strings.Split(portStr, "-")
 			if len(parts) == 2 {
 				startPort, err1 := strconv.Atoi(parts[0])
@@ -173,7 +218,6 @@ func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
 				}
 			}
 		} else {
-			// Single port
 			port, err := strconv.Atoi(portStr)
 			if err == nil {
 				usedPorts[port] = true
@@ -185,12 +229,10 @@ func (c *Client) getUsedPorts(protocol string) (map[int]bool, error) {
 }
 
 // FindAvailablePort finds an available port starting from the suggested port
-// It fetches all used ports once and searches locally for efficiency
 func (c *Client) FindAvailablePort(protocol string, suggestedPort int) (int, error) {
 	const maxAttempts = 1000
 	const maxPort = 65535
 
-	// Fetch all used ports once
 	usedPorts, err := c.getUsedPorts(protocol)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get used ports: %w", err)
@@ -198,17 +240,14 @@ func (c *Client) FindAvailablePort(protocol string, suggestedPort int) (int, err
 
 	slog.Debug("Port availability check", "protocol", protocol, "used_ports_count", len(usedPorts))
 
-	// Start from suggested port, or from 49152 (dynamic port range) if 0
 	startPort := suggestedPort
 	if startPort == 0 {
 		startPort = 49152
 	}
 
-	// Search for available port
 	for i := 0; i < maxAttempts; i++ {
 		port := startPort + i
 		if port > maxPort {
-			// Wrap around to dynamic port range
 			port = 49152 + (port - maxPort - 1)
 		}
 
@@ -222,10 +261,8 @@ func (c *Client) FindAvailablePort(protocol string, suggestedPort int) (int, err
 
 // AddPortMapping creates a dst-nat rule for port forwarding with retry
 func (c *Client) AddPortMapping(protocol string, internalPort, externalPort int, lifetime uint32, toAddress string) (*PortMappingResult, error) {
-	// First attempt
 	result, err := c.addPortMapping(protocol, internalPort, externalPort, lifetime, toAddress)
 	if err != nil {
-		// Retry once after 1 second
 		time.Sleep(1 * time.Second)
 		result, err = c.addPortMapping(protocol, internalPort, externalPort, lifetime, toAddress)
 	}
@@ -234,28 +271,19 @@ func (c *Client) AddPortMapping(protocol string, internalPort, externalPort int,
 
 // addPortMapping is the internal implementation without retry
 func (c *Client) addPortMapping(protocol string, internalPort, externalPort int, lifetime uint32, toAddress string) (*PortMappingResult, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	protocolLower := protocol
-	if protocol == "tcp" || protocol == "TCP" {
-		protocolLower = "tcp"
-	} else {
-		protocolLower = "udp"
-	}
+	protocolLower := normalizeProtocol(protocol)
 
 	portStr := fmt.Sprintf("%d", externalPort)
 	if externalPort == 0 {
 		portStr = fmt.Sprintf("%d", internalPort)
 	}
 
-	// Check if port is available before attempting to create the rule
 	requestedPort := externalPort
 	if requestedPort == 0 {
 		requestedPort = internalPort
 	}
 
-	available, err := c.isPortAvailableLocked(protocolLower, requestedPort)
+	available, err := c.isPortAvailable(protocolLower, requestedPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check port availability: %w", err)
 	}
@@ -273,7 +301,7 @@ func (c *Client) addPortMapping(protocol string, internalPort, externalPort int,
 		"to-addresses", toAddress,
 		"to-ports", internalPort)
 
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/firewall/nat/add",
 		"=chain=dstnat",
 		"=action=dst-nat",
@@ -308,20 +336,10 @@ func (c *Client) addPortMapping(protocol string, internalPort, externalPort int,
 
 // DeletePortMapping removes a dst-nat rule by finding it via comment
 func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	protocolLower := protocol
-	if protocol == "tcp" || protocol == "TCP" {
-		protocolLower = "tcp"
-	} else {
-		protocolLower = "udp"
-	}
-
+	protocolLower := normalizeProtocol(protocol)
 	comment := fmt.Sprintf("double-natpmp-%s-%d-%s", protocolLower, internalPort, toAddress)
 
-	// Find the rule by comment
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/firewall/nat/print",
 		"?comment="+comment,
 	)
@@ -337,8 +355,7 @@ func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress 
 
 	ruleID := reply.Re[0].Map[".id"]
 
-	// Delete the rule
-	_, err = c.client.Run(
+	_, err = c.run(
 		"/ip/firewall/nat/remove",
 		"=.id="+ruleID,
 	)
@@ -354,10 +371,7 @@ func (c *Client) DeletePortMapping(protocol string, internalPort int, toAddress 
 
 // DeletePortMappingByID removes a dst-nat rule by rule ID
 func (c *Client) DeletePortMappingByID(ruleID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	_, err := c.client.Run(
+	_, err := c.run(
 		"/ip/firewall/nat/remove",
 		"=.id="+ruleID,
 	)
@@ -373,20 +387,13 @@ func (c *Client) DeletePortMappingByID(ruleID string) error {
 
 // GetExternalIP returns the WAN IP address from the router
 func (c *Client) GetExternalIP() (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Get the first active address from the WAN interface
-	// This is router-specific - adjust based on your setup
-	reply, err := c.client.Run("/ip/address/print")
+	reply, err := c.run("/ip/address/print")
 
 	if err != nil {
 		return "", fmt.Errorf("failed to get external IP: %w", err)
 	}
 
 	if len(reply.Re) > 0 {
-		// Return the first address found
-		// You may need to filter by interface name
 		address := reply.Re[0].Map["address"]
 		return address, nil
 	}
@@ -407,11 +414,7 @@ type NATRule struct {
 
 // GetAllDoubleNATPMPRules returns all dst-nat rules created by this service
 func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Find all rules with our comment prefix
-	reply, err := c.client.Run(
+	reply, err := c.run(
 		"/ip/firewall/nat/print",
 		"?chain=dstnat",
 	)
@@ -424,7 +427,6 @@ func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
 
 	for _, re := range reply.Re {
 		comment := re.Map["comment"]
-		// Check if this is one of our rules (starts with "double-natpmp-")
 		if len(comment) > 14 && comment[:14] == "double-natpmp-" {
 			rules = append(rules, NATRule{
 				ID:          re.Map[".id"],
@@ -445,10 +447,7 @@ func (c *Client) GetAllDoubleNATPMPRules() ([]NATRule, error) {
 
 // DeleteRuleByID removes a dst-nat rule by its ID
 func (c *Client) DeleteRuleByID(ruleID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	_, err := c.client.Run(
+	_, err := c.run(
 		"/ip/firewall/nat/remove",
 		"=.id="+ruleID,
 	)
@@ -460,4 +459,12 @@ func (c *Client) DeleteRuleByID(ruleID string) error {
 	slog.Info("Removed stale MikroTik rule", "rule_id", ruleID)
 
 	return nil
+}
+
+// normalizeProtocol converts protocol string to lowercase
+func normalizeProtocol(protocol string) string {
+	if protocol == "tcp" || protocol == "TCP" {
+		return "tcp"
+	}
+	return "udp"
 }

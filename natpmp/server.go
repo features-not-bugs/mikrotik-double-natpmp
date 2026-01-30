@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	gslog "log/slog"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/features-not-bugs/mikrotik-double-natpmp/utility"
 )
 
-var slog = gslog.Default().With("component", "natpmp-server")
+var slog = utility.GetLogger().With("component", "natpmp-server")
 
 type ExternalAddressHandler func(remoteIP net.IP) *ExternalAddressResponse
 type PortMappingHandler func(request *PortMappingRequest, remoteIP net.IP) *PortMappingResponse
@@ -23,7 +24,6 @@ type Server struct {
 	portMappingHandler     PortMappingHandler
 	mu                     sync.RWMutex  // Protects conn
 	sem                    chan struct{} // Semaphore to limit concurrent handlers
-	maxConcurrent          int
 }
 
 // NewServer creates a new NAT-PMP server
@@ -34,7 +34,6 @@ func NewServer(listenAddr string, externalAddressHandler ExternalAddressHandler,
 		externalAddressHandler: externalAddressHandler,
 		portMappingHandler:     portMappingHandler,
 		sem:                    make(chan struct{}, maxConcurrentHandlers),
-		maxConcurrent:          maxConcurrentHandlers,
 	}
 }
 
