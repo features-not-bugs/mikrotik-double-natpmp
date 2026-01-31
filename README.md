@@ -23,12 +23,18 @@ This service creates coordinated port mappings across two NAT layers, allowing c
 
 ### Why Two Mappings?
 
+Both mappings are required to complete the traffic flow from the internet to your LAN client. Without the MikroTik dst-nat rule, traffic arriving from the VPN gateway would be dropped at the router. Without the VPN gateway mapping, traffic would never reach the VPN tunnel in the first place.
+
+1. **VPN Gateway** — Incoming internet traffic hits the VPN provider's public IP. The NAT-PMP mapping forwards it through the VPN tunnel to your MikroTik router.
+
+2. **MikroTik Router** — Traffic arrives on the WireGuard interface. The dst-nat rule forwards it to the actual LAN client.
+
 | Layer | Mapping | Lifetime | Purpose |
 |-------|---------|----------|---------|
-| MikroTik | dst-nat rule | Persistent | Forward traffic from VPN interface to LAN client |
-| VPN Gateway | NAT-PMP mapping | Time-limited | Forward traffic from internet to VPN tunnel |
+| VPN Gateway | NAT-PMP mapping | Time-limited (e.g., 60s) | Internet → VPN tunnel |
+| MikroTik | dst-nat rule | Persistent | VPN interface → LAN client |
 
-The MikroTik rule persists because it's cheap and the server tracks it. The VPN mapping has a short lifetime (set by the VPN provider), requiring client-driven renewals.
+The VPN mapping has a short lifetime enforced by the provider, so clients must send periodic renewals to keep the port open. The MikroTik dst-nat rule is kept persistent between renewals to avoid unnecessary churn, but is automatically deleted when the NAT-PMP lifetime expires without renewal.
 
 ## Features
 
