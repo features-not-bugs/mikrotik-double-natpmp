@@ -9,7 +9,7 @@ This service creates coordinated port mappings across two NAT layers, allowing c
 **Requires:** An upstream VPN gateway that supports NAT-PMP port forwarding (e.g., [ProtonVPN](https://pr.tn/ref/NDPEKXJJ)).
 
 <p align="center">
-  <img src=".github/diagrams/port-forward-diagram.svg" width="75%">
+  <img src=".github/diagrams/port-forward-diagram.svg" width="100%">
 </p>
 
 ### Port Mapping Flow
