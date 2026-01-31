@@ -87,21 +87,17 @@ The `test` policy is required for interface auto-detection via `/ip/route/check`
 ### 3. Deploy Container
 
 ```
-# Configure registry
-/container/config set registry-url=https://ghcr.io tmpdir=disk1/tmp
-
 # Create network interface
-/interface/veth add name=veth-natpmp address=192.168.88.250/24 gateway=192.168.88.1
-/interface/bridge/port add bridge=bridge interface=veth-natpmp
+/interface/veth add name=veth-natpmp address=172.30.254.2/30 gateway=172.30.254.1
 
 # Set environment variables
 /container/envs add name=natpmp key=VPN_GATEWAY value="10.2.0.1"
-/container/envs add name=natpmp key=MIKROTIK_API_ADDRESS value="192.168.88.1:8728"
+/container/envs add name=natpmp key=MIKROTIK_API_ADDRESS value="172.30.254.1:8728"
 /container/envs add name=natpmp key=MIKROTIK_API_PASSWORD value="your-password"
 
 # Create and start container
 /container add remote-image=ghcr.io/features-not-bugs/mikrotik-double-natpmp:latest \
-    interface=veth-natpmp envlist=natpmp logging=yes
+    interface=veth-natpmp envlist=natpmp start-on-boot=yes name=double-natpmp
 /container/start 0
 ```
 
@@ -111,7 +107,7 @@ NAT-PMP clients send requests to their default gateway on UDP port 5351. Add a d
 
 ```
 /ip/firewall/nat add chain=dstnat protocol=udp dst-port=5351 \
-    action=dst-nat to-addresses=192.168.88.250 \
+    action=dst-nat to-addresses=172.30.254.2 \
     comment="Redirect NAT-PMP to double-natpmp container"
 ```
 
@@ -122,7 +118,7 @@ NAT-PMP clients send requests to their default gateway on UDP port 5351. Add a d
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `VPN_GATEWAY` | Upstream VPN gateway IP | `10.2.0.1` |
-| `MIKROTIK_API_ADDRESS` | MikroTik API endpoint | `192.168.88.1:8728` |
+| `MIKROTIK_API_ADDRESS` | MikroTik API endpoint | `172.30.254.1:8728` |
 | `MIKROTIK_API_PASSWORD` | MikroTik API password | - |
 
 ### Optional
