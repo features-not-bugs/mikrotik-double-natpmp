@@ -24,6 +24,7 @@ type Server struct {
 	portMappingHandler     PortMappingHandler
 	mu                     sync.RWMutex  // Protects conn
 	sem                    chan struct{} // Semaphore to limit concurrent handlers
+	startTime              time.Time
 }
 
 // NewServer creates a new NAT-PMP server
@@ -34,6 +35,7 @@ func NewServer(listenAddr string, externalAddressHandler ExternalAddressHandler,
 		externalAddressHandler: externalAddressHandler,
 		portMappingHandler:     portMappingHandler,
 		sem:                    make(chan struct{}, maxConcurrentHandlers),
+		startTime:              time.Now(),
 	}
 }
 
@@ -68,6 +70,10 @@ func (s *Server) Stop() error {
 		return err
 	}
 	return nil
+}
+
+func (s *Server) GetUptimeInSeconds() uint32 {
+	return uint32(time.Since(s.startTime).Seconds())
 }
 
 func (s *Server) serve(ctx context.Context) {
@@ -222,7 +228,7 @@ func createUnsupportedVersionResponse() []byte {
 	// Result Code: 1 (Unsupported Version)
 	binary.BigEndian.PutUint16(response[2:4], uint16(ResultUnsupportedVersion))
 	// Seconds Since Start of Epoch
-	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(response[4:8], uint32(time.Since(time.Now())))
 
 	return response
 }
