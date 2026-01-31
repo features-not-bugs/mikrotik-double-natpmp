@@ -1,90 +1,25 @@
 # MikroTik Double NAT-PMP
 
-A NAT-PMP (RFC 6886) server for double-NAT scenarios that synchronizes port mappings between a MikroTik router and VPN gateway.
+A NAT-PMP (RFC 6886) server for double-NAT scenarios that synchronizes port mappings between a MikroTik router and an upstream VPN gateway.
 
 ## Overview
 
-This NAT-PMP server creates coordinated port mappings across two NAT layers, allowing clients behind a VPN-connected MikroTik router to receive incoming connections.
+This service creates coordinated port mappings across two NAT layers, allowing clients behind a VPN-connected MikroTik router to receive incoming connections.
 
-```
-                                    Internet
-                                        │
-                                   VPN Gateway (NAT-PMP)
-                                        │
-┌───────────────────────────────────────┼───────────────────────────────────────┐
-│ MikroTik Router                       │                                       │
-│                              ┌────────┴────────┐                              │
-│                              │  WireGuard/VPN  │                              │
-│                              │   Interface     │                              │
-│                              └────────┬────────┘                              │
-│                                       │                                       │
-│                              ┌────────┴────────┐                              │
-│                              │  double-natpmp  │◄─── This service             │
-│                              │     :5351       │                              │
-│                              └────────┬────────┘                              │
-│                                       │                                       │
-└───────────────────────────────────────┼───────────────────────────────────────┘
-                                        │
-                                   LAN Clients
-                              (NAT-PMP requests)
-```
+**Requires:** An upstream VPN gateway that supports NAT-PMP port forwarding (e.g., [ProtonVPN](https://pr.tn/ref/NDPEKXJJ)).
 
-## Quick Start
-
-```bash
-# Build
-go build -o double-natpmp
-
-# Run
-VPN_GATEWAY=10.2.0.1 \
-MIKROTIK_API_ADDRESS=192.168.1.254:8728 \
-MIKROTIK_API_PASSWORD=your-password \
-./double-natpmp
-```
-
-## Configuration
-
-### Required
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `VPN_GATEWAY` | VPN gateway IP address | `10.2.0.1` |
-| `MIKROTIK_API_ADDRESS` | MikroTik API endpoint | `192.168.1.254:8728` |
-| `MIKROTIK_API_PASSWORD` | MikroTik API password | - |
-
-### Optional
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LISTEN_ADDR` | NAT-PMP listen address | `:5351` |
-| `MIKROTIK_API_USER` | MikroTik API username | `admin` |
-| `MIKROTIK_API_TLS` | Use TLS for API connection | `false` |
-| `MIKROTIK_IN_INTERFACE` | Interface for dst-nat rules | auto-detected |
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
-
-## Features
-
-- **RFC 6886 compliant** - Full NAT-PMP protocol implementation
-- **Double-NAT orchestration** - Synchronized mappings across both NAT layers
-- **Automatic interface detection** - Determines MikroTik interface from VPN gateway routing
-- **Connection pooling** - 4 concurrent MikroTik API connections for parallel operations
-- **Per-mapping serialization** - Concurrent requests for different ports run in parallel; same-port requests are serialized
-- **Transaction rollback** - Automatic cleanup if mapping creation fails partway
-- **Periodic reconciliation** - Removes orphaned MikroTik rules every 10 minutes
-- **Graceful shutdown** - Cleanup of all mappings on termination
-- **Rate limiting** - Maximum 100 concurrent request handlers
-- **Auto-reconnection** - Recovers from MikroTik API connection failures
-
-## How It Works
+<p align="center">
+  <img src=".github/diagrams/port-forward-diagram.svg" width="75%">
+</p>
 
 ### Port Mapping Flow
 
-1. Client sends NAT-PMP mapping request to this server
-2. Server creates **persistent** dst-nat rule on MikroTik router
-3. Server forwards request to VPN gateway NAT-PMP server
-4. VPN gateway returns granted lifetime (often shorter, e.g., 60s)
-5. Server returns VPN's actual lifetime to client
-6. Client renews before expiration; server only refreshes VPN mapping (MikroTik rule persists)
+1. LAN client sends NAT-PMP mapping request to the MikroTik router (default gateway)
+2. MikroTik firewall dst-nats the request to the double-natpmp container
+3. double-natpmp creates a **persistent** dst-nat rule on the MikroTik router, forwarding the requested port to the LAN client (uses suggested port if available, otherwise assigns a random port)
+4. double-natpmp forwards the NAT-PMP request upstream to the VPN gateway, using the MikroTik dst-nat port as the internal port
+5. VPN gateway returns a response with the granted external port and lifetime
+6. double-natpmp returns the response to the LAN client with the VPN gateway's external port and lifetime
 
 ### Why Two Mappings?
 
@@ -95,26 +30,104 @@ MIKROTIK_API_PASSWORD=your-password \
 
 The MikroTik rule persists because it's cheap and the server tracks it. The VPN mapping has a short lifetime (set by the VPN provider), requiring client-driven renewals.
 
-## MikroTik Setup
+## Features
 
-The service creates dst-nat rules with comments prefixed `double-natpmp-`. Ensure your MikroTik API user has permissions to:
+- **RFC 6886 compliant** - Full NAT-PMP protocol implementation
+- **Double-NAT orchestration** - Synchronized mappings across both NAT layers
+- **Automatic interface detection** - Determines MikroTik interface from VPN gateway routing
+- **Connection pooling** - 4 concurrent MikroTik API connections
+- **Per-mapping serialization** - Different ports run in parallel; same-port requests serialize
+- **Transaction rollback** - Automatic cleanup on partial failures
+- **Periodic reconciliation** - Removes orphaned MikroTik rules every 10 minutes
+- **Graceful shutdown** - Cleanup of all mappings on termination
+- **Auto-reconnection** - Recovers from MikroTik API connection failures
 
-- Read/write `/ip/firewall/nat`
-- Read `/ip/route` (for interface auto-detection)
+## Quick Start
 
-Example MikroTik user setup:
+```bash
+docker pull ghcr.io/features-not-bugs/mikrotik-double-natpmp:latest
+
+docker run -d \
+  -e VPN_GATEWAY=10.2.0.1 \
+  -e MIKROTIK_API_ADDRESS=192.168.88.1:8728 \
+  -e MIKROTIK_API_PASSWORD=your-password \
+  -p 5351:5351/udp \
+  ghcr.io/features-not-bugs/mikrotik-double-natpmp:latest
 ```
-/user group add name=natpmp policy=read,write,test,api,!ftp,!reboot,!policy,!sensitive
+
+## MikroTik Container Deployment
+
+The recommended deployment runs this service as a container directly on MikroTik RouterOS (v7.4+).
+
+### 1. Enable Container Mode
+
+```
+/system/device-mode/update container=yes
+```
+
+Reboot after running this command.
+
+### 2. Create API User
+
+The service needs API access to manage dst-nat rules:
+
+```
+/user/group add name=natpmp policy=read,write,test,api,!ftp,!reboot,!policy,!sensitive
 /user add name=natpmp group=natpmp password=your-password
 ```
 
-The `test` policy is required for `/ip/route/check` (interface auto-detection).
+The `test` policy is required for interface auto-detection via `/ip/route/check`.
 
-## Building
+### 3. Deploy Container
 
-```bash
-go build -o double-natpmp
 ```
+# Configure registry
+/container/config set registry-url=https://ghcr.io tmpdir=disk1/tmp
+
+# Create network interface
+/interface/veth add name=veth-natpmp address=192.168.88.250/24 gateway=192.168.88.1
+/interface/bridge/port add bridge=bridge interface=veth-natpmp
+
+# Set environment variables
+/container/envs add name=natpmp key=VPN_GATEWAY value="10.2.0.1"
+/container/envs add name=natpmp key=MIKROTIK_API_ADDRESS value="192.168.88.1:8728"
+/container/envs add name=natpmp key=MIKROTIK_API_PASSWORD value="your-password"
+
+# Create and start container
+/container add remote-image=ghcr.io/features-not-bugs/mikrotik-double-natpmp:latest \
+    interface=veth-natpmp envlist=natpmp logging=yes
+/container/start 0
+```
+
+### 4. Redirect NAT-PMP Requests
+
+NAT-PMP clients send requests to their default gateway on UDP port 5351. Add a dst-nat rule to redirect these to the container:
+
+```
+/ip/firewall/nat add chain=dstnat protocol=udp dst-port=5351 \
+    action=dst-nat to-addresses=192.168.88.250 \
+    comment="Redirect NAT-PMP to double-natpmp container"
+```
+
+## Configuration
+
+### Required
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `VPN_GATEWAY` | Upstream VPN gateway IP | `10.2.0.1` |
+| `MIKROTIK_API_ADDRESS` | MikroTik API endpoint | `192.168.88.1:8728` |
+| `MIKROTIK_API_PASSWORD` | MikroTik API password | - |
+
+### Optional
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LISTEN_ADDR` | NAT-PMP listen address | `:5351` |
+| `MIKROTIK_API_USER` | MikroTik API username | `admin` |
+| `MIKROTIK_API_TLS` | Use TLS for API | `false` |
+| `MIKROTIK_IN_INTERFACE` | Interface for dst-nat rules | auto-detected |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 
 ## License
 
