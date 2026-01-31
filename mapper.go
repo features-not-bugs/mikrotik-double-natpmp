@@ -50,6 +50,7 @@ type mapper struct {
 	mikrotik            *mikrotik.Client
 	vpnGatewayNATClient *natpmp.Client
 	server              *natpmp.Server
+	startTime           time.Time
 
 	// Mapping storage
 	mu       sync.RWMutex
@@ -64,6 +65,7 @@ func newMapper(cfg *config.Config, mikroTikClient *mikrotik.Client) *mapper {
 		mikrotik:            mikroTikClient,
 		vpnGatewayNATClient: natpmp.NewClient(cfg.VpnGateway),
 		mappings:            make(map[key]*mapping),
+		startTime:           time.Now(),
 	}
 
 	// Create NAT-PMP server with handlers
@@ -152,6 +154,7 @@ func (s *mapper) handleExternalAddress(clientIP net.IP) *natpmp.ExternalAddressR
 	slog.Info("Retrieved external address",
 		"client", clientIP,
 		"external_address", response.ExternalAddress)
+	response.Epoch = uint32(time.Since(s.startTime).Seconds())
 	return response
 }
 
@@ -240,7 +243,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 			return &natpmp.PortMappingResponse{
 				Protocol:     request.Protocol,
 				ResultCode:   natpmp.ResultOutOfResources,
-				Epoch:        uint32(time.Now().Unix()),
+				Epoch:        uint32(time.Since(s.startTime).Seconds()),
 				InternalPort: request.InternalPort,
 			}
 		}
@@ -263,7 +266,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 		//return &natpmp.PortMappingResponse{
 		//	Protocol:     request.Protocol,
 		//	ResultCode:   natpmp.ResultNetworkFailure,
-		//	Epoch:        uint32(time.Now().Unix()),
+		//	Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		//	InternalPort: request.InternalPort,
 		//}
 	}
@@ -299,7 +302,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 		//return &natpmp.PortMappingResponse{
 		//	Protocol:     request.Protocol,
 		//	ResultCode:   natpmp.ResultNetworkFailure,
-		//	Epoch:        uint32(time.Now().Unix()),
+		//	Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		//	InternalPort: request.InternalPort,
 		//}
 	}
@@ -352,7 +355,7 @@ func (s *mapper) handlePortMappingCreation(request *natpmp.PortMappingRequest, c
 	return &natpmp.PortMappingResponse{
 		Protocol:     request.Protocol,
 		ResultCode:   natpmp.ResultSuccess,
-		Epoch:        uint32(time.Now().Unix()),
+		Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		InternalPort: request.InternalPort,
 		ExternalPort: vpnResult.ExternalPort,
 		Lifetime:     vpnResult.Lifetime,
@@ -371,7 +374,7 @@ func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, c
 		return &natpmp.PortMappingResponse{
 			Protocol:     request.Protocol,
 			ResultCode:   natpmp.ResultSuccess,
-			Epoch:        uint32(time.Now().Unix()),
+			Epoch:        uint32(time.Since(s.startTime).Seconds()),
 			InternalPort: request.InternalPort,
 			ExternalPort: 0,
 			Lifetime:     0,
@@ -418,7 +421,7 @@ func (s *mapper) handlePortMappingDeletion(request *natpmp.PortMappingRequest, c
 	return &natpmp.PortMappingResponse{
 		Protocol:     request.Protocol,
 		ResultCode:   natpmp.ResultSuccess,
-		Epoch:        uint32(time.Now().Unix()),
+		Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		InternalPort: request.InternalPort,
 		ExternalPort: 0,
 		Lifetime:     0,
@@ -448,7 +451,7 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 		//return &natpmp.PortMappingResponse{
 		//	Protocol:     request.Protocol,
 		//	ResultCode:   natpmp.ResultNetworkFailure,
-		//	Epoch:        uint32(time.Now().Unix()),
+		//	Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		//	InternalPort: request.InternalPort,
 		//}
 	}
@@ -494,7 +497,7 @@ func (s *mapper) handlePortMappingRenewal(mapping *mapping, request *natpmp.Port
 	return &natpmp.PortMappingResponse{
 		Protocol:     request.Protocol,
 		ResultCode:   natpmp.ResultSuccess,
-		Epoch:        uint32(time.Now().Unix()),
+		Epoch:        uint32(time.Since(s.startTime).Seconds()),
 		InternalPort: request.InternalPort,
 		ExternalPort: vpnResult.ExternalPort,
 		Lifetime:     vpnResult.Lifetime,

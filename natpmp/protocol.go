@@ -173,7 +173,6 @@ func (e *ExternalAddressResponse) fromBytes(bytes []byte) error {
 	}
 	e.ResultCode = Result(binary.BigEndian.Uint16(bytes[2:4]))
 	e.Epoch = binary.BigEndian.Uint32(bytes[4:8])
-	e.ExternalAddress = make(net.IP, 4)
-	copy(e.ExternalAddress, bytes[8:12])
+	e.ExternalAddress = net.IPv4(bytes[8], bytes[9], bytes[10], bytes[11])
 	return nil
 }
