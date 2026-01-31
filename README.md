@@ -65,13 +65,23 @@ docker run -d \
 
 The recommended deployment runs this service as a container directly on MikroTik RouterOS (v7.4+).
 
-### 1. Enable Container Mode
+### 1. Enable Container Support
+
+You can skip this step if you already have container support enabled.
 
 ```
+# Enable trusting of built in CAs for secure image retrieval
+/certificate/settings/set builtin-trust-anchors=trusted
+
+# Install and enable the container package
+/system/package/update/check-for-updates
+/system/package/enable container
+
+# Enable the device to run containers
 /system/device-mode/update container=yes
 ```
 
-Reboot after running this command.
+Reboot after running these commands.
 
 ### 2. Create API User
 
@@ -89,16 +99,18 @@ The `test` policy is required for interface auto-detection via `/ip/route/check`
 ```
 # Create network interface
 /interface/veth add name=veth-natpmp address=172.30.254.2/30 gateway=172.30.254.1
+/ip/address add 
 
 # Set environment variables
-/container/envs add name=natpmp key=VPN_GATEWAY value="10.2.0.1"
-/container/envs add name=natpmp key=MIKROTIK_API_ADDRESS value="172.30.254.1:8728"
-/container/envs add name=natpmp key=MIKROTIK_API_PASSWORD value="your-password"
+/container/envs add list=natpmp key=VPN_GATEWAY value="10.2.0.1"
+/container/envs add list=natpmp key=MIKROTIK_API_ADDRESS value="172.30.254.1:8728"
+/container/envs add list=natpmp key=MIKROTIK_API_USER value="natpmp"
+/container/envs add list=natpmp key=MIKROTIK_API_PASSWORD value="your-password"
 
 # Create and start container
 /container add remote-image=ghcr.io/features-not-bugs/mikrotik-double-natpmp:latest \
-    interface=veth-natpmp envlist=natpmp start-on-boot=yes name=double-natpmp
-/container/start 0
+    interface=veth-natpmp envlist=natpmp start-on-boot=yes name=double-natpmp auto-restart-interval=5
+/container/start double-natpmp
 ```
 
 ### 4. Redirect NAT-PMP Requests
@@ -107,8 +119,8 @@ NAT-PMP clients send requests to their default gateway on UDP port 5351. Add a d
 
 ```
 /ip/firewall/nat add chain=dstnat protocol=udp dst-port=5351 \
-    action=dst-nat to-addresses=172.30.254.2 \
-    comment="Redirect NAT-PMP to double-natpmp container"
+    action=dst-nat to-addresses=172.30.254.2 dst-address-type=local \
+    src-address-type=!local comment="Redirect NAT-PMP to double-natpmp container"
 ```
 
 ## Configuration
